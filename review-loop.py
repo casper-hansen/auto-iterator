@@ -29,7 +29,7 @@ NC = "\033[0m" if _USE_COLOR else ""
 
 # Defaults aligned with currently available Cursor models.
 DEFAULT_IMPL_MODEL = "claude-4.6-opus-high"
-DEFAULT_FIX_MODEL = "claude-4.6-opus-high-thinking"
+DEFAULT_FIX_MODEL = "claude-4.6-opus-high"
 DEFAULT_REVIEWER_MODEL = "gpt-5.4-xhigh"
 
 # ── Timestamped logging ──────────────────────────────────────────────────────
