@@ -490,9 +490,15 @@ def _fmt_result(name: str, args: dict, result: object) -> str:  # noqa: C901
 
             # 3. Grep
             if name == "grep":
-                total = s.get("totalMatchedLines", s.get("totalLines", "?"))
                 pat = _truncate(args.get("pattern", ""), 30)
-                return f'grep ✓ {total} match(es) for "{pat}"'
+                total = s.get("totalMatchedLines", s.get("totalLines", None))
+                if total is None:
+                    for ws in (s.get("workspaceResults") or {}).values():
+                        c = ws.get("content", {})
+                        total = c.get("totalMatchedLines", c.get("totalLines"))
+                        if total is not None:
+                            break
+                return f'grep ✓ {total if total is not None else "?"} match(es) for "{pat}"'
 
             # 4. Read
             if name == "read":
