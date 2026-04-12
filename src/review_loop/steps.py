@@ -21,7 +21,7 @@ async def run_implementation(cfg: RunConfig) -> None:
     print()
 
     rc, _ = await run_agent(
-        mode="write", model=cfg.impl_model, prompt=cfg.prompt,
+        model=cfg.impl_model, prompt=cfg.prompt,
         tag=tag, **cfg.agent_kw,
     )
     if rc == 0:
@@ -41,7 +41,7 @@ async def run_review(
     log(f"Review — {CYAN}{cfg.reviewer_model}{NC}", tag)
 
     rc, review_text = await run_agent(
-        mode="readonly", model=cfg.reviewer_model,
+        model=cfg.reviewer_model,
         prompt=build_review_prompt(cfg.prompt, cfg.context, history),
         tag=tag, **cfg.agent_kw,
     )
@@ -71,7 +71,7 @@ async def run_fix(
     log(f"Fixing issues — {CYAN}{cfg.fix_model}{NC}", tag)
 
     rc, fix_text = await run_agent(
-        mode="write", model=cfg.fix_model,
+        model=cfg.fix_model,
         prompt=build_fix_prompt(cfg.prompt, cfg.context, history),
         tag=tag, **cfg.agent_kw,
     )

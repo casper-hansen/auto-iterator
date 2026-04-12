@@ -137,7 +137,6 @@ class _StreamReader:
 
 def _build_cmd(
     agent_cmd: str,
-    mode: str,
     model: str,
     prompt: str,
     workspace: str,
@@ -150,9 +149,8 @@ def _build_cmd(
         "--model", model,
         "--workspace", workspace,
         "--trust",
+        "--force",
     ]
-    if mode == "write":
-        cmd.append("--force")
     cmd.extend(extra_flags)
     cmd.append(prompt)
     return cmd
@@ -160,7 +158,6 @@ def _build_cmd(
 
 async def run_agent(
     *,
-    mode: str,
     model: str,
     prompt: str,
     tag: str,
@@ -172,7 +169,7 @@ async def run_agent(
 
     Returns *(exit_code, captured_full_text)*.
     """
-    cmd = _build_cmd(agent_cmd, mode, model, prompt, workspace, extra_flags)
+    cmd = _build_cmd(agent_cmd, model, prompt, workspace, extra_flags)
 
     master_fd, slave_fd = pty.openpty()
     proc = await asyncio.create_subprocess_exec(
