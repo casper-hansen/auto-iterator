@@ -26,6 +26,11 @@ CYAN = "\033[0;36m" if _USE_COLOR else ""
 MAGENTA = "\033[0;35m" if _USE_COLOR else ""
 NC = "\033[0m" if _USE_COLOR else ""
 
+# Defaults aligned with currently available Cursor models.
+DEFAULT_IMPL_MODEL = "claude-4.6-opus-high"
+DEFAULT_FIX_MODEL = "claude-4.6-opus-high-thinking"
+DEFAULT_REVIEWER_MODEL = "gpt-5.4-xhigh"
+
 # ── Timestamped logging ──────────────────────────────────────────────────────
 
 
@@ -218,11 +223,21 @@ def build_parser() -> argparse.ArgumentParser:
         prog="review-loop.py",
         description="Automated implement → review → fix loop using the Cursor CLI",
     )
-    p.add_argument("--prompt", required=True, help="Feature / task description")
-    p.add_argument("--context", default="", help="Extra context for reviewers")
-    p.add_argument("--impl-model", default="claude-opus-4.6")
-    p.add_argument("--fix-model", default="claude-opus-4.6-thinking")
-    p.add_argument("--reviewer", default="gpt-5.4-xhigh", dest="reviewer_model")
+    prompt_group = p.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument("--prompt", help="Feature / task description")
+    prompt_group.add_argument(
+        "--prompt-file",
+        help="Path to a UTF-8 text file containing the feature / task description",
+    )
+    context_group = p.add_mutually_exclusive_group()
+    context_group.add_argument("--context", default="", help="Extra context for reviewers")
+    context_group.add_argument(
+        "--context-file",
+        help="Path to a UTF-8 text file containing extra reviewer context",
+    )
+    p.add_argument("--impl-model", default=DEFAULT_IMPL_MODEL)
+    p.add_argument("--fix-model", default=DEFAULT_FIX_MODEL)
+    p.add_argument("--reviewer", default=DEFAULT_REVIEWER_MODEL, dest="reviewer_model")
     p.add_argument("--max-outer", type=int, default=10)
     p.add_argument("--max-inner", type=int, default=10)
     p.add_argument("--workspace", default=".")
@@ -235,8 +250,12 @@ async def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     agent_cmd = os.environ.get("AGENT_CMD", "agent")
-    prompt: str = args.prompt
-    context: str = args.context
+    try:
+        prompt = _load_text_arg(args.prompt, args.prompt_file, label="prompt")
+        context = _load_text_arg(args.context, args.context_file, label="context")
+    except OSError as exc:
+        err(str(exc))
+        return 1
     impl_model: str = args.impl_model
     fix_model: str = args.fix_model or impl_model
     reviewer_model: str = args.reviewer_model
@@ -432,6 +451,21 @@ async def _command_exists(cmd: str) -> bool:
         return proc.returncode == 0
     except OSError:
         return False
+
+
+def _load_text_arg(
+    inline_value: str | None,
+    file_value: str | None,
+    *,
+    label: str,
+) -> str:
+    if file_value:
+        path = Path(file_value).expanduser()
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise OSError(f"Could not read --{label}-file '{path}': {exc}") from exc
+    return (inline_value or "").strip()
 
 
 if __name__ == "__main__":
