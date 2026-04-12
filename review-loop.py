@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+import pty
 import re
 import sys
 from datetime import datetime, timezone
@@ -40,25 +41,25 @@ def _ts() -> str:
 
 def log(msg: str, tag: str = "") -> None:
     prefix = f"{DIM}{_ts()}{NC} {tag} " if tag else f"{DIM}{_ts()}{NC} "
-    print(f"{prefix}{BLUE}▸{NC} {msg}")
+    print(f"{prefix}{BLUE}▸{NC} {msg}", flush=True)
 
 
 def ok(msg: str, tag: str = "") -> None:
     prefix = f"{DIM}{_ts()}{NC} {tag} " if tag else f"{DIM}{_ts()}{NC} "
-    print(f"{prefix}{GREEN}✓{NC} {msg}")
+    print(f"{prefix}{GREEN}✓{NC} {msg}", flush=True)
 
 
 def warn(msg: str, tag: str = "") -> None:
     prefix = f"{DIM}{_ts()}{NC} {tag} " if tag else f"{DIM}{_ts()}{NC} "
-    print(f"{prefix}{YELLOW}⚠{NC} {msg}")
+    print(f"{prefix}{YELLOW}⚠{NC} {msg}", flush=True)
 
 
 def err(msg: str) -> None:
-    print(f"{DIM}{_ts()}{NC} {RED}✗{NC} {msg}", file=sys.stderr)
+    print(f"{DIM}{_ts()}{NC} {RED}✗{NC} {msg}", file=sys.stderr, flush=True)
 
 
 def hr() -> None:
-    print(f"{DIM}{'─' * 72}{NC}")
+    print(f"{DIM}{'─' * 72}{NC}", flush=True)
 
 
 def make_tag(outer: int, inner: int) -> str:
@@ -93,20 +94,20 @@ class OutputFormatter:
             self._state = self.THINKING
             after = _THINKING_OPEN.sub("", line).strip()
             if after:
-                print(f"{ts} {self.tag}   {DIM}{after}{NC}")
+                print(f"{ts} {self.tag}   {DIM}{after}{NC}", flush=True)
             return
 
         if _THINKING_CLOSE.search(line):
             before = _THINKING_CLOSE.sub("", line).strip()
             if before:
-                print(f"{ts} {self.tag}   {DIM}{before}{NC}")
+                print(f"{ts} {self.tag}   {DIM}{before}{NC}", flush=True)
             self._state = self.ASSISTANT
             return
 
         if self._state == self.THINKING:
-            print(f"{ts} {self.tag}   {DIM}{line}{NC}")
+            print(f"{ts} {self.tag}   {DIM}{line}{NC}", flush=True)
         else:
-            print(f"{ts} {self.tag}   {line}")
+            print(f"{ts} {self.tag}   {line}", flush=True)
 
     def flush(self) -> None:
         self._state = self.ASSISTANT
@@ -125,12 +126,17 @@ async def run_agent(
     agent_cmd: str,
     extra_flags: list[str],
 ) -> tuple[int, str]:
-    """Launch the Cursor agent CLI, stream formatted output to stdout.
+    """Launch the Cursor agent CLI with stream-json output.
 
-    Returns (exit_code, captured_output).
+    Streams tool-call and assistant-text events to the console as they
+    arrive, so the log file is populated in real time.
+
+    Returns (exit_code, captured_full_text).
     """
     cmd: list[str] = [
         agent_cmd, "-p",
+        "--output-format", "stream-json",
+        "--stream-partial-output",
         "--model", model,
         "--workspace", workspace,
         "--trust",
@@ -140,24 +146,161 @@ async def run_agent(
     cmd.extend(extra_flags)
     cmd.append(prompt)
 
+    master_fd, slave_fd = pty.openpty()
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=slave_fd,
+        stderr=slave_fd,
     )
-    assert proc.stdout is not None
+    os.close(slave_fd)
 
-    lines: list[str] = []
+    full_text: list[str] = []
     fmt = OutputFormatter(tag)
+    text_buf: list[str] = []
 
-    async for raw in proc.stdout:
-        line = raw.decode("utf-8", errors="replace").rstrip("\n")
-        lines.append(line)
-        fmt.feed(line)
+    def _flush_text() -> None:
+        """Flush any accumulated partial text to the formatter."""
+        if not text_buf:
+            return
+        assembled = "".join(text_buf)
+        text_buf.clear()
+        for line in assembled.split("\n"):
+            fmt.feed(line)
+        sys.stdout.flush()
+
+    def _flush_complete_lines() -> None:
+        """Flush only complete lines (up to last newline) from text_buf."""
+        combined = "".join(text_buf)
+        if "\n" not in combined:
+            return
+        parts = combined.split("\n")
+        for l in parts[:-1]:
+            fmt.feed(l)
+        text_buf.clear()
+        if parts[-1]:
+            text_buf.append(parts[-1])
+        sys.stdout.flush()
+
+    def _read_pty() -> None:
+        """Blocking reader in a thread — parses stream-json events."""
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                raw_line, buf = buf.split(b"\n", 1)
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r")
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    fmt.feed(line)
+                    sys.stdout.flush()
+                    continue
+                _handle_event(evt)
+        if buf:
+            leftover = buf.decode("utf-8", errors="replace").rstrip("\r")
+            if leftover:
+                try:
+                    evt = json.loads(leftover)
+                    _handle_event(evt)
+                except json.JSONDecodeError:
+                    fmt.feed(leftover)
+                    sys.stdout.flush()
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    def _handle_event(evt: dict) -> None:
+        etype = evt.get("type", "")
+
+        if etype == "assistant":
+            content_parts = evt.get("message", {}).get("content", [])
+            ts_ms = evt.get("timestamp_ms")
+            has_model_call_id = "model_call_id" in evt
+            is_partial = ts_ms is not None and not has_model_call_id
+
+            if is_partial:
+                for part in content_parts:
+                    if part.get("type") == "text" and part["text"]:
+                        text_buf.append(part["text"])
+                _flush_complete_lines()
+            else:
+                _flush_text()
+                assembled = "".join(
+                    p.get("text", "")
+                    for p in content_parts
+                    if p.get("type") == "text"
+                )
+                if assembled:
+                    full_text.append(assembled)
+
+        elif etype == "tool_call":
+            _flush_text()
+            sub = evt.get("subtype", "")
+            tc = evt.get("tool_call", {})
+            if sub == "started":
+                fmt.feed(f"[tool] {_tool_summary(tc)}")
+                sys.stdout.flush()
+            elif sub == "completed":
+                fmt.feed(f"[tool] {_tool_summary(tc, completed=True)}")
+                sys.stdout.flush()
+
+        elif etype == "result":
+            _flush_text()
+            result_text = evt.get("result", "")
+            if result_text and not full_text:
+                full_text.append(result_text)
+
+    loop = asyncio.get_running_loop()
+    read_task = loop.run_in_executor(None, _read_pty)
+    await proc.wait()
+    await read_task
 
     fmt.flush()
-    await proc.wait()
-    return proc.returncode or 0, "\n".join(lines)
+    return proc.returncode or 0, "\n".join(full_text)
+
+
+_TOOL_CALL_NOISY_KEYS = {
+    "toolCallId", "simpleCommands", "hasInputRedirect", "hasOutputRedirect",
+    "parsingResult", "fileOutputThresholdBytes", "isBackground",
+    "skipApproval", "timeoutBehavior", "closeStdin",
+}
+
+
+def _tool_summary(tc: dict, *, completed: bool = False) -> str:
+    """Return a compact one-line summary of a stream-json tool_call payload."""
+    for key in tc:
+        if not key.endswith("ToolCall"):
+            continue
+        name = key.replace("ToolCall", "")
+        inner = tc[key]
+
+        if completed and "result" in inner:
+            result = inner["result"]
+            short = json.dumps(result, separators=(",", ":"))
+            if len(short) > 200:
+                short = short[:197] + "..."
+            return f"{name} => {short}"
+
+        args = {k: v for k, v in inner.get("args", {}).items()
+                if k not in _TOOL_CALL_NOISY_KEYS}
+        if args:
+            short = json.dumps(args, separators=(",", ":"))
+            if len(short) > 200:
+                short = short[:197] + "..."
+            return f"{name}({short})"
+        return name
+    return json.dumps(tc, separators=(",", ":"))[:200]
 
 
 # ── Prompt builders ──────────────────────────────────────────────────────────
