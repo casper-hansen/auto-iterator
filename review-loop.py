@@ -826,25 +826,39 @@ async def main(argv: list[str] | None = None) -> int:
             print()
 
         if verdict != "APPROVED":
-            warn("Inner loop did not reach approval — stopping")
-            break
+            warn(
+                f"Inner loop did not reach approval after {max_inner} "
+                "iteration(s) — outer loop will retry with fresh context",
+            )
+            hr()
+            print()
+            continue
 
         if inner == 1:
             approved = True
             if outer == 1:
                 ok("Approved on first pass")
             else:
-                ok(f"Fresh-eyes review found no issues on outer loop {outer}")
+                ok(f"Fresh-eyes review approved on outer loop {outer}")
             break
 
+        ok(
+            f"Inner loop converged after {inner} iteration(s) — "
+            "starting fresh-eyes validation in next outer loop",
+        )
         hr()
         print()
 
-    if not approved and verdict == "APPROVED":
-        warn(
-            f"Inner loop converged but MAX_OUTER ({max_outer}) exhausted "
-            "without a clean fresh-eyes pass"
-        )
+    if not approved:
+        if verdict == "APPROVED":
+            warn(
+                f"Inner loop converged but MAX_OUTER ({max_outer}) exhausted "
+                "without a clean fresh-eyes pass"
+            )
+        else:
+            warn(
+                f"Exhausted {max_outer} outer loop(s) without reaching approval"
+            )
 
     # ── Summary ──────────────────────────────────────────────────────────
     print()
