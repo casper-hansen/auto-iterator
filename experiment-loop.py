@@ -50,8 +50,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--training-cmd",
-        default="cd straw && .venv/bin/python -m straw.train --config {config_path}",
-        help="Training command template; {config_path} is replaced per run",
+        default=(
+            "mkdir -p auto-iterator/logs && cd straw && "
+            ".venv/bin/python -m straw.train --config {config_path} "
+            "2>&1 | tee ../auto-iterator/logs/{run_name}.log"
+        ),
+        help="Training command template; {config_path} and {run_name} are replaced per run",
     )
     p.add_argument("--experimenter-model", default=DEFAULT_EXPERIMENTER_MODEL)
     p.add_argument("--adjuster-model", default=DEFAULT_ADJUSTER_MODEL)
