@@ -9,14 +9,14 @@ import os
 import sys
 from pathlib import Path
 
-from review_loop.config import (
+from iterator_loop.feature.config import (
     DEFAULT_FIX_MODEL,
     DEFAULT_IMPL_MODEL,
     DEFAULT_REVIEWER_MODEL,
     RunConfig,
 )
-from review_loop.logging import banner, err, log, make_tag, ok, section, summary, warn
-from review_loop.steps import run_fix, run_implementation, run_review
+from iterator_loop.logging import banner, err, log, make_tag, ok, section, summary, warn
+from iterator_loop.feature.steps import run_fix, run_implementation, run_review
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

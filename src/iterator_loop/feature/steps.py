@@ -6,10 +6,10 @@ that surrounds it, so callers see only the semantic result.
 
 from __future__ import annotations
 
-from .agent import run_agent
-from .colors import BOLD, CYAN, GREEN, YELLOW, NC
+from ..agent import run_agent
+from ..colors import BOLD, CYAN, GREEN, YELLOW, NC
 from .config import RunConfig
-from .logging import hr, log, ok, warn
+from ..logging import hr, log, ok, warn
 from .prompts import build_fix_prompt, build_review_prompt, parse_verdict
 
 
