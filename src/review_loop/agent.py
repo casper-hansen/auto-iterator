@@ -8,8 +8,16 @@ import os
 import pty
 import sys
 
+from .logging import warn
 from .output_formatter import OutputFormatter, _ANSI_RE
 from .tool_formatter import tool_summary
+
+_STREAM_CLOSED = "WritableIterable is closed"
+
+_RESUME_PROMPT = (
+    "Your previous session was interrupted by a connection timeout. "
+    "Please continue where you left off."
+)
 
 
 class _StreamReader:
@@ -20,6 +28,7 @@ class _StreamReader:
         self._fmt = fmt
         self._text_buf: list[str] = []
         self._full_text: list[str] = []
+        self.stream_closed = False
 
     @property
     def full_text(self) -> str:
@@ -111,6 +120,8 @@ class _StreamReader:
                 except json.JSONDecodeError:
                     cleaned = _ANSI_RE.sub("", line).strip()
                     if cleaned:
+                        if _STREAM_CLOSED in cleaned:
+                            self.stream_closed = True
                         self._fmt.feed(cleaned)
                         sys.stdout.flush()
                     continue
@@ -156,21 +167,33 @@ def _build_cmd(
     return cmd
 
 
-async def run_agent(
-    *,
-    model: str,
-    prompt: str,
-    tag: str,
-    workspace: str,
+def _build_cmd_continue(
     agent_cmd: str,
+    model: str,
+    workspace: str,
     extra_flags: list[str],
-) -> tuple[int, str]:
-    """Launch the Cursor agent CLI and stream its output.
+) -> list[str]:
+    """Build a CLI invocation that resumes the most recent session."""
+    cmd = [
+        agent_cmd, "-p",
+        "--output-format", "stream-json",
+        "--stream-partial-output",
+        "--model", model,
+        "--workspace", workspace,
+        "--trust",
+        "--force",
+        "--continue",
+    ]
+    cmd.extend(extra_flags)
+    cmd.append(_RESUME_PROMPT)
+    return cmd
 
-    Returns *(exit_code, captured_full_text)*.
-    """
-    cmd = _build_cmd(agent_cmd, model, prompt, workspace, extra_flags)
 
+async def _run_once(
+    cmd: list[str],
+    tag: str,
+) -> tuple[int, str, bool]:
+    """Run a single agent session. Returns *(exit_code, text, stream_closed)*."""
     master_fd, slave_fd = pty.openpty()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -188,4 +211,48 @@ async def run_agent(
     await read_task
 
     reader._fmt.flush()
-    return proc.returncode or 0, reader.full_text
+    return proc.returncode or 0, reader.full_text, reader.stream_closed
+
+
+async def run_agent(
+    *,
+    model: str,
+    prompt: str,
+    tag: str,
+    workspace: str,
+    agent_cmd: str,
+    extra_flags: list[str],
+) -> tuple[int, str]:
+    """Launch the Cursor agent CLI and stream its output.
+
+    If the server-side gRPC stream closes (``WritableIterable is closed``),
+    the session is automatically resumed via ``--continue`` until the agent
+    finishes naturally.
+
+    Returns *(exit_code, captured_full_text)*.
+    """
+    all_text: list[str] = []
+    attempt = 0
+
+    while True:
+        if attempt == 0:
+            cmd = _build_cmd(agent_cmd, model, prompt, workspace, extra_flags)
+        else:
+            cmd = _build_cmd_continue(agent_cmd, model, workspace, extra_flags)
+
+        rc, text, stream_closed = await _run_once(cmd, tag)
+
+        if text:
+            all_text.append(text)
+
+        if stream_closed:
+            attempt += 1
+            warn(
+                f"Stream closed, auto-resuming (attempt {attempt + 1})…",
+                tag,
+            )
+            continue
+
+        break
+
+    return rc, "\n".join(all_text)
