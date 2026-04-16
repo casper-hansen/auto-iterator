@@ -1,10 +1,11 @@
-"""End-to-end test: run_agent auto-resumes after WritableIterable stream closure.
+"""End-to-end test: run_agent auto-resumes after server-side session kills.
 
-Uses a mock agent script that:
-  1st call  → emits stream-json, then prints "S: WritableIterable is closed", exits 1
-  2nd call  → (with --continue) emits stream-json, exits 0
+Covers both observed failure modes:
+  1. Explicit "WritableIterable is closed" message + non-zero exit
+  2. Silent non-zero exit while a tool call is still in-flight
 
-Verifies that run_agent transparently retries and returns the combined text.
+Uses a mock agent script that dies on the first call and succeeds
+on the second (--continue) call.
 """
 
 from __future__ import annotations
@@ -16,16 +17,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Ensure the package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from iterator_loop.agent import run_agent  # noqa: E402
 
-
 MOCK_SCRIPT = Path(__file__).resolve().parent / "mock_agent.sh"
 
 
-async def _test_auto_resume() -> None:
+async def _run_scenario(failure_mode: str) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         state_file = os.path.join(tmp, "mock_state")
 
@@ -34,12 +33,13 @@ async def _test_auto_resume() -> None:
 
         env_backup = os.environ.copy()
         os.environ["MOCK_STATE_FILE"] = state_file
+        os.environ["MOCK_FAILURE_MODE"] = failure_mode
 
         try:
             rc, text = await run_agent(
                 model="test-model",
                 prompt="Run the experiment",
-                tag="[TEST]",
+                tag=f"[{failure_mode}]",
                 workspace="/tmp",
                 agent_cmd=mock_path,
                 extra_flags=[],
@@ -48,23 +48,31 @@ async def _test_auto_resume() -> None:
             os.environ.clear()
             os.environ.update(env_backup)
 
-    print()
-    print("=" * 60)
-    print(f"Exit code : {rc}")
-    print(f"Text len  : {len(text)} chars")
-    print(f"State file existed (retry happened): {os.path.exists(state_file)}")
-    print()
-    print("Captured text:")
-    print("-" * 60)
-    print(text)
-    print("-" * 60)
+    print(f"  exit code : {rc}")
+    print(f"  text len  : {len(text)} chars")
+    print(f"  captured  : {text[:120]}…" if len(text) > 120 else f"  captured  : {text}")
 
     assert rc == 0, f"Expected exit code 0, got {rc}"
-    assert "Resumed after stream closure" in text, "Resume text not found"
+    assert "Resumed after interruption" in text, "Resume text not found"
     assert "Task complete" in text, "Completion text not found"
-    print()
-    print("PASS — auto-resume worked correctly")
+    print(f"  PASS\n")
+
+
+async def _main() -> None:
+    print("=" * 60)
+    print("Test 1: stream_closed (WritableIterable is closed)")
+    print("-" * 60)
+    await _run_scenario("stream_closed")
+
+    print("=" * 60)
+    print("Test 2: silent_kill (non-zero exit, pending tool call)")
+    print("-" * 60)
+    await _run_scenario("silent_kill")
+
+    print("=" * 60)
+    print("ALL TESTS PASSED")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    asyncio.run(_test_auto_resume())
+    asyncio.run(_main())

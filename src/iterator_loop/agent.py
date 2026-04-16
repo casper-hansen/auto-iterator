@@ -29,10 +29,19 @@ class _StreamReader:
         self._text_buf: list[str] = []
         self._full_text: list[str] = []
         self.stream_closed = False
+        self._pending_tools = 0
 
     @property
     def full_text(self) -> str:
         return "\n".join(self._full_text)
+
+    @property
+    def interrupted(self) -> bool:
+        """True when the session was killed by the server rather than
+        finishing naturally.  Covers two observed failure modes:
+        1. Explicit ``WritableIterable is closed`` message.
+        2. Silent non-zero exit while a tool call is still in-flight."""
+        return self.stream_closed or self._pending_tools > 0
 
     # ── Partial-text buffering ────────────────────────────────────────────
 
@@ -87,8 +96,10 @@ class _StreamReader:
             sub = evt.get("subtype", "")
             tc = evt.get("tool_call", {})
             if sub == "started":
+                self._pending_tools += 1
                 self._fmt.feed_tool(f"→ {tool_summary(tc)}")
             elif sub == "completed":
+                self._pending_tools = max(0, self._pending_tools - 1)
                 self._fmt.feed_tool(f"← {tool_summary(tc, completed=True)}")
 
         elif etype == "result":
@@ -193,7 +204,12 @@ async def _run_once(
     cmd: list[str],
     tag: str,
 ) -> tuple[int, str, bool]:
-    """Run a single agent session. Returns *(exit_code, text, stream_closed)*."""
+    """Run a single agent session.
+
+    Returns *(exit_code, text, interrupted)* where *interrupted* is ``True``
+    when the server killed the session (explicit stream-closed message **or**
+    non-zero exit with a tool call still in-flight).
+    """
     master_fd, slave_fd = pty.openpty()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -211,7 +227,9 @@ async def _run_once(
     await read_task
 
     reader._fmt.flush()
-    return proc.returncode or 0, reader.full_text, reader.stream_closed
+    rc = proc.returncode or 0
+    interrupted = reader.interrupted if rc != 0 else False
+    return rc, reader.full_text, interrupted
 
 
 async def run_agent(
@@ -225,9 +243,9 @@ async def run_agent(
 ) -> tuple[int, str]:
     """Launch the Cursor agent CLI and stream its output.
 
-    If the server-side gRPC stream closes (``WritableIterable is closed``),
-    the session is automatically resumed via ``--continue`` until the agent
-    finishes naturally.
+    If the server kills the session (``WritableIterable is closed`` **or**
+    silent exit while a tool call is pending), the session is automatically
+    resumed via ``--continue`` until the agent finishes naturally.
 
     Returns *(exit_code, captured_full_text)*.
     """
@@ -240,15 +258,15 @@ async def run_agent(
         else:
             cmd = _build_cmd_continue(agent_cmd, model, workspace, extra_flags)
 
-        rc, text, stream_closed = await _run_once(cmd, tag)
+        rc, text, interrupted = await _run_once(cmd, tag)
 
         if text:
             all_text.append(text)
 
-        if stream_closed:
+        if interrupted:
             attempt += 1
             warn(
-                f"Stream closed, auto-resuming (attempt {attempt + 1})…",
+                f"Session interrupted, auto-resuming (attempt {attempt + 1})…",
                 tag,
             )
             continue
