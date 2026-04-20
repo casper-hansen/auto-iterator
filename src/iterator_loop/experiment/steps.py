@@ -42,7 +42,7 @@ async def run_baseline(cfg: ExperimentConfig) -> str:
     if rc == 0:
         ok("Baseline complete", tag)
     else:
-        warn("Baseline agent exited with non-zero status", tag)
+        warn(f"Baseline agent exited with rc={rc}", tag)
     hr()
     print()
     return text
@@ -74,7 +74,7 @@ async def run_experiment(
     if rc == 0:
         ok("Experiment run complete", tag)
     else:
-        warn("Experiment agent exited with non-zero status", tag)
+        warn(f"Experiment agent exited with rc={rc}", tag)
     hr()
     print()
     return text
@@ -110,7 +110,7 @@ async def run_analysis(
     history.append({"role": "analyst", "content": analysis_text})
 
     if rc != 0:
-        warn("Analyst agent exited with non-zero status", tag)
+        warn(f"Analyst agent exited with rc={rc}", tag)
         return "ITERATE"
 
     verdict = parse_verdict(analysis_text)
@@ -150,7 +150,7 @@ async def run_adjustment(
     if rc == 0:
         ok("Adjustment applied", tag)
     else:
-        warn("Adjuster agent exited with non-zero status", tag)
+        warn(f"Adjuster agent exited with rc={rc}", tag)
     hr()
     print()
     return adjust_text

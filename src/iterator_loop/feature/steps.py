@@ -27,7 +27,7 @@ async def run_implementation(cfg: RunConfig) -> None:
     if rc == 0:
         ok("Implementation complete", tag)
     else:
-        warn("Implementation agent exited with non-zero status", tag)
+        warn(f"Implementation agent exited with rc={rc}", tag)
     hr()
     print()
 
@@ -48,7 +48,7 @@ async def run_review(
     history.append({"role": "reviewer", "content": review_text})
 
     if rc != 0:
-        warn("Reviewer agent exited with non-zero status", tag)
+        warn(f"Reviewer agent exited with rc={rc}", tag)
         return "CHANGES_NEEDED"
 
     verdict = parse_verdict(review_text)
@@ -80,4 +80,4 @@ async def run_fix(
     if rc == 0:
         ok("Fixes applied", tag)
     else:
-        warn("Fix agent exited with non-zero status", tag)
+        warn(f"Fix agent exited with rc={rc}", tag)
