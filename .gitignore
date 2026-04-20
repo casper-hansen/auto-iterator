@@ -1,5 +1,6 @@
 # Experiment loop logs
 logs/
+prompts/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
