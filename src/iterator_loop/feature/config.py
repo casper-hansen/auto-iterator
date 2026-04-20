@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-DEFAULT_IMPL_MODEL = "claude-4.6-opus-max"
-DEFAULT_FIX_MODEL = "claude-4.6-opus-max"
+DEFAULT_IMPL_MODEL = "claude-opus-4-7-thinking-max"
+DEFAULT_FIX_MODEL = "claude-opus-4-7-thinking-max"
 DEFAULT_REVIEWER_MODEL = "gpt-5.4-xhigh"
 
 
