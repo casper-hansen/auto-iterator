@@ -1,13 +1,15 @@
-"""RunConfig dataclass — single object for all loop configuration."""
+"""RunConfig dataclass — single object for all loop configuration.
+
+Model defaults are owned by each backend (see
+``iterator_loop.backends.cursor.CursorBackend`` /
+``iterator_loop.backends.claude_code.ClaudeCodeBackend``), not by this
+module, because each CLI speaks to a different set of model names.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-
-DEFAULT_IMPL_MODEL = "claude-opus-4-7-thinking-max"
-DEFAULT_FIX_MODEL = "claude-opus-4-7-thinking-max"
-DEFAULT_REVIEWER_MODEL = "gpt-5.4-xhigh"
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,7 @@ class RunConfig:
     skip_impl: bool
     extra_flags: tuple[str, ...]
     agent_cmd: str = "agent"
+    backend: str = "cursor"
 
     @property
     def agent_kw(self) -> dict:
@@ -31,6 +34,7 @@ class RunConfig:
             workspace=self.workspace,
             agent_cmd=self.agent_cmd,
             extra_flags=list(self.extra_flags),
+            backend=self.backend,
         )
 
     def validate(self) -> str | None:
@@ -53,5 +57,7 @@ class RunConfig:
             "max_inner": self.max_inner,
             "workspace": self.workspace,
             "skip_impl": self.skip_impl,
+            "backend": self.backend,
+            "agent_cmd": self.agent_cmd,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }

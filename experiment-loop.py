@@ -11,12 +11,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from iterator_loop.experiment.config import (
-    DEFAULT_ADJUSTER_MODEL,
-    DEFAULT_ANALYST_MODEL,
-    DEFAULT_EXPERIMENTER_MODEL,
-    ExperimentConfig,
-)
+from iterator_loop.backends import BACKENDS, get_backend
+from iterator_loop.experiment.config import ExperimentConfig
 from iterator_loop.colors import BOLD, DIM, GREEN, YELLOW, NC
 from iterator_loop.logging import banner, err, hr, log, ok, section, warn
 
@@ -24,7 +20,8 @@ from iterator_loop.logging import banner, err, hr, log, ok, section, warn
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(be) -> argparse.ArgumentParser:
+    """Parser whose model defaults come from the active backend."""
     p = argparse.ArgumentParser(
         prog="experiment-loop",
         description="Run → analyze → iterate loop for reward validation",
@@ -57,9 +54,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         help="Training command template; {config_path} and {run_name} are replaced per run",
     )
-    p.add_argument("--experimenter-model", default=DEFAULT_EXPERIMENTER_MODEL)
-    p.add_argument("--adjuster-model", default=DEFAULT_ADJUSTER_MODEL)
-    p.add_argument("--analyst-model", default=DEFAULT_ANALYST_MODEL)
+    p.add_argument("--experimenter-model", default=be.default_experimenter_model)
+    p.add_argument("--adjuster-model", default=be.default_adjuster_model)
+    p.add_argument("--analyst-model", default=be.default_analyst_model)
     p.add_argument("--max-iterations", type=int, default=5)
     p.add_argument("--workspace", default=".")
     p.add_argument("--skip-baseline", action="store_true")
@@ -83,7 +80,9 @@ def _load_text(
 
 
 def _parse_config(argv: list[str] | None) -> ExperimentConfig:
-    args = _build_parser().parse_args(argv)
+    backend = os.environ.get("AGENT_BACKEND", "cursor")
+    be = get_backend(backend)
+    args = _build_parser(be).parse_args(argv)
     return ExperimentConfig(
         hypothesis=_load_text(args.hypothesis, args.hypothesis_file, "hypothesis"),
         success_criteria=_load_text(
@@ -99,7 +98,8 @@ def _parse_config(argv: list[str] | None) -> ExperimentConfig:
         workspace=str(Path(args.workspace).resolve()),
         skip_baseline=args.skip_baseline,
         extra_flags=tuple(args.extra_flags),
-        agent_cmd=os.environ.get("AGENT_CMD", "agent"),
+        agent_cmd=os.environ.get("AGENT_CMD", be.default_cmd),
+        backend=backend,
     )
 
 
@@ -163,14 +163,19 @@ async def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         err(str(exc))
         return 1
+    except ValueError as exc:
+        err(str(exc))
+        print(f"Valid AGENT_BACKEND values: {', '.join(sorted(BACKENDS))}")
+        return 1
 
     if error := cfg.validate():
         err(error)
         return 1
 
+    be = get_backend(cfg.backend)
     if not await _command_exists(cfg.agent_cmd):
-        err(f"Cursor agent CLI not found ('{cfg.agent_cmd}').")
-        print("Install it with: curl https://cursor.com/install -fsSL | bash")
+        err(f"{be.display_name} not found ('{cfg.agent_cmd}').")
+        print(be.install_hint)
         return 1
 
     banner("Experiment Loop", cfg.banner_items())

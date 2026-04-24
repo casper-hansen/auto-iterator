@@ -9,12 +9,8 @@ import os
 import sys
 from pathlib import Path
 
-from iterator_loop.feature.config import (
-    DEFAULT_FIX_MODEL,
-    DEFAULT_IMPL_MODEL,
-    DEFAULT_REVIEWER_MODEL,
-    RunConfig,
-)
+from iterator_loop.backends import BACKENDS, get_backend
+from iterator_loop.feature.config import RunConfig
 from iterator_loop.logging import banner, err, log, make_tag, ok, section, summary, warn
 from iterator_loop.feature.steps import run_fix, run_implementation, run_review
 
@@ -22,10 +18,11 @@ from iterator_loop.feature.steps import run_fix, run_implementation, run_review
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(be) -> argparse.ArgumentParser:
+    """Parser whose model defaults come from the active backend."""
     p = argparse.ArgumentParser(
         prog="review-loop",
-        description="Automated implement → review → fix loop using the Cursor CLI",
+        description="Automated implement → review → fix loop",
     )
     prompt_grp = p.add_mutually_exclusive_group(required=True)
     prompt_grp.add_argument("--prompt", help="Feature / task description")
@@ -39,9 +36,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--context-file",
         help="Path to a UTF-8 text file containing extra reviewer context",
     )
-    p.add_argument("--impl-model", default=DEFAULT_IMPL_MODEL)
-    p.add_argument("--fix-model", default=DEFAULT_FIX_MODEL)
-    p.add_argument("--reviewer", default=DEFAULT_REVIEWER_MODEL, dest="reviewer_model")
+    p.add_argument("--impl-model", default=be.default_impl_model)
+    p.add_argument("--fix-model", default=be.default_fix_model)
+    p.add_argument(
+        "--reviewer", default=be.default_reviewer_model, dest="reviewer_model"
+    )
     p.add_argument("--max-outer", type=int, default=10)
     p.add_argument("--max-inner", type=int, default=10)
     p.add_argument("--workspace", default=".")
@@ -66,7 +65,9 @@ def _load_text(
 
 
 def _parse_config(argv: list[str] | None) -> RunConfig:
-    args = _build_parser().parse_args(argv)
+    backend = os.environ.get("AGENT_BACKEND", "cursor")
+    be = get_backend(backend)
+    args = _build_parser(be).parse_args(argv)
     return RunConfig(
         prompt=_load_text(args.prompt, args.prompt_file, "prompt"),
         context=_load_text(args.context, args.context_file, "context"),
@@ -78,7 +79,8 @@ def _parse_config(argv: list[str] | None) -> RunConfig:
         workspace=str(Path(args.workspace).resolve()),
         skip_impl=args.skip_impl,
         extra_flags=tuple(args.extra_flags),
-        agent_cmd=os.environ.get("AGENT_CMD", "agent"),
+        agent_cmd=os.environ.get("AGENT_CMD", be.default_cmd),
+        backend=backend,
     )
 
 
@@ -104,14 +106,19 @@ async def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         err(str(exc))
         return 1
+    except ValueError as exc:
+        err(str(exc))
+        print(f"Valid AGENT_BACKEND values: {', '.join(sorted(BACKENDS))}")
+        return 1
 
     if error := cfg.validate():
         err(error)
         return 1
 
+    be = get_backend(cfg.backend)
     if not await _command_exists(cfg.agent_cmd):
-        err(f"Cursor agent CLI not found ('{cfg.agent_cmd}').")
-        print("Install it with: curl https://cursor.com/install -fsSL | bash")
+        err(f"{be.display_name} not found ('{cfg.agent_cmd}').")
+        print(be.install_hint)
         return 1
 
     banner("Review Loop", cfg.banner_items())

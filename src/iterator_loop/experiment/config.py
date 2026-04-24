@@ -1,13 +1,15 @@
-"""ExperimentConfig dataclass — single object for all experiment loop configuration."""
+"""ExperimentConfig dataclass — single object for all experiment loop configuration.
+
+Model defaults are owned by each backend (see
+``iterator_loop.backends.cursor.CursorBackend`` /
+``iterator_loop.backends.claude_code.ClaudeCodeBackend``), not by this
+module, because each CLI speaks to a different set of model names.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-
-DEFAULT_EXPERIMENTER_MODEL = "claude-opus-4-7-thinking-max"
-DEFAULT_ADJUSTER_MODEL = "claude-opus-4-7-thinking-max"
-DEFAULT_ANALYST_MODEL = "gpt-5.4-xhigh"
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,7 @@ class ExperimentConfig:
     skip_baseline: bool
     extra_flags: tuple[str, ...]
     agent_cmd: str = "agent"
+    backend: str = "cursor"
 
     @property
     def agent_kw(self) -> dict:
@@ -33,6 +36,7 @@ class ExperimentConfig:
             workspace=self.workspace,
             agent_cmd=self.agent_cmd,
             extra_flags=list(self.extra_flags),
+            backend=self.backend,
         )
 
     def validate(self) -> str | None:
@@ -59,5 +63,7 @@ class ExperimentConfig:
             "max_iterations": self.max_iterations,
             "workspace": self.workspace,
             "skip_baseline": self.skip_baseline,
+            "backend": self.backend,
+            "agent_cmd": self.agent_cmd,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }

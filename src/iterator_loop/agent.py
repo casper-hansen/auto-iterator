@@ -1,4 +1,4 @@
-"""Async runner for the Cursor agent CLI with stream-json output."""
+"""Async runner for a pluggable CLI agent backend with stream-json output."""
 
 from __future__ import annotations
 
@@ -10,18 +10,15 @@ import signal as signal_mod
 import sys
 from dataclasses import dataclass
 
+from .backends import get_backend
 from .logging import warn
 from .output_formatter import OutputFormatter, _ANSI_RE
-from .tool_formatter import tool_summary
 
 _STREAM_CLOSED = "WritableIterable is closed"
 
 _DEFAULT_MAX_RESUME_ATTEMPTS = 3
 
-_RESUME_PROMPT = (
-    "Your previous session ended unexpectedly before completing the task. "
-    "Please continue where you left off."
-)
+_DEFAULT_BACKEND = "cursor"
 
 
 @dataclass
@@ -69,11 +66,12 @@ class _RunOutcome:
 
 
 class _StreamReader:
-    """Consumes newline-delimited JSON from a PTY fd, routing events to an
-    OutputFormatter while accumulating the full assistant text."""
+    """Consumes newline-delimited JSON from a PTY fd, routing events via the
+    backend while accumulating the full assistant text."""
 
-    def __init__(self, fmt: OutputFormatter) -> None:
+    def __init__(self, fmt: OutputFormatter, backend) -> None:
         self._fmt = fmt
+        self._backend = backend
         self._text_buf: list[str] = []
         self._full_text: list[str] = []
         self.stream_closed = False
@@ -107,49 +105,6 @@ class _StreamReader:
             self._text_buf.append(parts[-1])
         sys.stdout.flush()
 
-    # ── Event dispatch ────────────────────────────────────────────────────
-
-    def _handle_event(self, evt: dict) -> None:
-        etype = evt.get("type", "")
-
-        if etype == "assistant":
-            content_parts = evt.get("message", {}).get("content", [])
-            ts_ms = evt.get("timestamp_ms")
-            is_partial = ts_ms is not None and "model_call_id" not in evt
-
-            if is_partial:
-                for part in content_parts:
-                    if part.get("type") == "text" and part["text"]:
-                        self._text_buf.append(part["text"])
-                self._flush_complete_lines()
-            else:
-                self._flush_text()
-                assembled = "".join(
-                    p.get("text", "")
-                    for p in content_parts
-                    if p.get("type") == "text"
-                )
-                if assembled:
-                    self._full_text.append(assembled)
-
-        elif etype == "tool_call":
-            self._flush_text()
-            sub = evt.get("subtype", "")
-            tc = evt.get("tool_call", {})
-            if sub == "started":
-                self.pending_tools += 1
-                self._fmt.feed_tool(f"→ {tool_summary(tc)}")
-            elif sub == "completed":
-                self.pending_tools = max(0, self.pending_tools - 1)
-                self._fmt.feed_tool(f"← {tool_summary(tc, completed=True)}")
-
-        elif etype == "result":
-            self._flush_text()
-            self.saw_result = True
-            result_text = evt.get("result", "")
-            if result_text and not self._full_text:
-                self._full_text.append(result_text)
-
     # ── PTY reader (runs in a thread via run_in_executor) ─────────────────
 
     def read_pty(self, master_fd: int) -> None:
@@ -178,13 +133,13 @@ class _StreamReader:
                         self._fmt.feed(cleaned)
                         sys.stdout.flush()
                     continue
-                self._handle_event(evt)
+                self._backend.handle_event(evt, self)
 
         if buf:
             leftover = buf.decode("utf-8", errors="replace").rstrip("\r")
             if leftover:
                 try:
-                    self._handle_event(json.loads(leftover))
+                    self._backend.handle_event(json.loads(leftover), self)
                 except json.JSONDecodeError:
                     cleaned = _ANSI_RE.sub("", leftover).strip()
                     if cleaned:
@@ -207,49 +162,6 @@ class _StreamReader:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-def _build_cmd(
-    agent_cmd: str,
-    model: str,
-    prompt: str,
-    workspace: str,
-    extra_flags: list[str],
-) -> list[str]:
-    cmd = [
-        agent_cmd, "-p",
-        "--output-format", "stream-json",
-        "--stream-partial-output",
-        "--model", model,
-        "--workspace", workspace,
-        "--trust",
-        "--force",
-    ]
-    cmd.extend(extra_flags)
-    cmd.append(prompt)
-    return cmd
-
-
-def _build_cmd_continue(
-    agent_cmd: str,
-    model: str,
-    workspace: str,
-    extra_flags: list[str],
-) -> list[str]:
-    """Build a CLI invocation that resumes the most recent session."""
-    cmd = [
-        agent_cmd, "-p",
-        "--output-format", "stream-json",
-        "--stream-partial-output",
-        "--model", model,
-        "--workspace", workspace,
-        "--trust",
-        "--force",
-        "--continue",
-    ]
-    cmd.extend(extra_flags)
-    cmd.append(_RESUME_PROMPT)
-    return cmd
-
-
 def _signal_name_from_rc(rc: int) -> str:
     """Map a negative Popen-style returncode to its signal name."""
     if rc >= 0:
@@ -263,6 +175,9 @@ def _signal_name_from_rc(rc: int) -> str:
 async def _run_once(
     cmd: list[str],
     tag: str,
+    backend,
+    *,
+    cwd: str | None = None,
 ) -> _RunOutcome:
     """Run a single agent session and collect everything the child emits.
 
@@ -284,10 +199,11 @@ async def _run_once(
         stdout=slave_fd,
         stderr=slave_fd,
         start_new_session=True,
+        cwd=cwd,
     )
     os.close(slave_fd)
 
-    reader = _StreamReader(OutputFormatter(tag))
+    reader = _StreamReader(OutputFormatter(tag), backend)
 
     loop = asyncio.get_running_loop()
     read_task = loop.run_in_executor(None, reader.read_pty, master_fd)
@@ -314,31 +230,39 @@ async def run_agent(
     workspace: str,
     agent_cmd: str,
     extra_flags: list[str],
+    backend: str = _DEFAULT_BACKEND,
     max_resume_attempts: int = _DEFAULT_MAX_RESUME_ATTEMPTS,
 ) -> tuple[int, str]:
-    """Launch the Cursor agent CLI and stream its output.
+    """Launch the configured agent CLI and stream its output.
+
+    ``backend`` selects the CLI adapter ("cursor" or "claude-code").  The
+    backend translates ``run_agent``'s generic kwargs into CLI flags and
+    decodes the CLI's stream-json events into the ``_StreamReader`` state
+    the loop inspects (text, tool counts, ``saw_result``).
 
     If the session ends abnormally — server-side kill, signal-induced death
     (SIGKILL / SIGSEGV / …), or any non-zero exit that did not produce a
     stream-json ``result`` event — the session is automatically resumed
-    via ``--continue`` up to ``max_resume_attempts`` times.  Every failure
-    is logged with its exact exit code (and signal name, when applicable)
-    so a broken shutdown is always visible instead of silently ignored.
+    via the backend's continue command up to ``max_resume_attempts`` times.
+    Every failure is logged with its exact exit code (and signal name, when
+    applicable) so a broken shutdown is always visible instead of silently
+    ignored.
 
     Returns ``(exit_code, captured_full_text)``.  ``exit_code`` is the rc
     of the final attempt — caller-visible and easy to include in warnings.
     """
+    be = get_backend(backend)
     all_text: list[str] = []
     attempt = 0
     last_rc = 0
 
     while True:
         if attempt == 0:
-            cmd = _build_cmd(agent_cmd, model, prompt, workspace, extra_flags)
+            cmd = be.build_initial_cmd(agent_cmd, model, prompt, workspace, extra_flags)
         else:
-            cmd = _build_cmd_continue(agent_cmd, model, workspace, extra_flags)
+            cmd = be.build_continue_cmd(agent_cmd, model, workspace, extra_flags)
 
-        outcome = await _run_once(cmd, tag)
+        outcome = await _run_once(cmd, tag, be, cwd=workspace)
         last_rc = outcome.rc
 
         if outcome.text:

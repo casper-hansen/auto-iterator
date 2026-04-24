@@ -9,7 +9,16 @@ from .logging import _ts
 
 _THINKING_OPEN = re.compile(r"<(?:antml:)?thinking>")
 _THINKING_CLOSE = re.compile(r"</(?:antml:)?thinking>")
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\].*?\x07")
+
+# CSI: ESC [ <params> <intermediate> <final>, where each class uses its
+# spec byte range. The digits/`;?` original covered standard SGR, but
+# Claude Code emits private-parameter codes like \x1b[>4m and \x1b[<u
+# (params in 0x30-0x3f including `<` `>` `=`), which the old charset
+# missed and left visible as "[>4m[<u". The OSC branch (ESC ] ... BEL)
+# is unchanged.
+_ANSI_RE = re.compile(
+    r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b\].*?\x07"
+)
 
 
 class OutputFormatter:
