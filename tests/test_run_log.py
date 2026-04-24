@@ -80,7 +80,6 @@ def test_spec_roundtrip() -> None:
         extra_flags=("--foo", "--bar"),
         agent_cmd="claude",
         backend="claude-code",
-        context="some context",
     )
     spec = cfg_to_spec(cfg, agent_type="review-loop")
     # Must be JSON-serializable.

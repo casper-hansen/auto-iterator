@@ -1,6 +1,6 @@
 """Control-file drain for the review-loop runner.
 
-Operator intents (guidance, rewind, prompt/context replacement, pause) are
+Operator intents (guidance, rewind, prompt replacement, pause) are
 expressed as files dropped into ``<run_dir>/control/`` by the ``ai`` CLI.
 This module knows how to consume them atomically at a single well-defined
 boundary — currently ``inner_started`` — and translate them into typed
@@ -28,7 +28,6 @@ from typing import Optional
 
 from .events import EventLog, RunState
 from .run_dir import (
-    CTL_CONTEXT,
     CTL_GUIDANCE,
     CTL_PAUSE,
     CTL_PROMPT,
@@ -80,12 +79,10 @@ def drain_control(
     prompt is applied *before* the rewind, which is what we want: the
     rewound flow uses the updated prompt on its next review.
     """
-    # Order matters: prompt/context/guidance mutations first so the
-    # post-rewind flow sees the new values; rewind goes last because the
-    # runner may short-circuit the rest of the inner-loop body on its
-    # return.
+    # Order matters: prompt/guidance mutations first so the post-rewind
+    # flow sees the new values; rewind goes last because the runner may
+    # short-circuit the rest of the inner-loop body on its return.
     _consume_prompt(paths, state, log)
-    _consume_context(paths, state, log)
     _consume_guidance(paths, state, log)
     _apply_pause_state(paths, state, log)
     return _consume_rewind(paths, state, log)
@@ -102,16 +99,6 @@ def _consume_prompt(paths: RunPaths, state: RunState, log: EventLog) -> None:
     state.prompt = text
     evt = log.emit("prompt_updated", preview=text[:200], length=len(text))
     log.audit({"event": "prompt_updated", "seq": evt["seq"], "text": text})
-
-
-def _consume_context(paths: RunPaths, state: RunState, log: EventLog) -> None:
-    f = paths.control_file(CTL_CONTEXT)
-    text = _take_text(f)
-    if text is None:
-        return
-    state.context = text
-    evt = log.emit("context_updated", preview=text[:200], length=len(text))
-    log.audit({"event": "context_updated", "seq": evt["seq"], "text": text})
 
 
 def _consume_guidance(paths: RunPaths, state: RunState, log: EventLog) -> None:

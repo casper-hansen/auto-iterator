@@ -46,7 +46,6 @@ EVENT_TYPES = frozenset({
     "rewind_applied",
     "rewind_narrowed",
     "prompt_updated",
-    "context_updated",
     "paused",
     "resumed",
     "control_rejected",
@@ -66,8 +65,8 @@ class RunState:
     This object is the single source of truth for both ``state.json`` on
     disk and the in-process control flow of the runner.
 
-    * ``prompt`` / ``context`` start from ``RunConfig`` but can be mutated
-      by ``ai set-prompt`` / ``ai set-context`` between boundaries.
+    * ``prompt`` starts from ``RunConfig.task`` but can be mutated by
+      ``ai set-prompt`` between boundaries.
     * ``history`` is the accumulated review/fix conversation within the
       current outer loop; it resets at the top of each outer, or is
       truncated by ``rewind``.
@@ -77,7 +76,6 @@ class RunState:
 
     run_id: str
     prompt: str
-    context: str = ""
     outer: int = 0
     inner: int = 0
     phase: str = "init"
@@ -121,7 +119,6 @@ class RunState:
             "guidance_pending": len(self.guidance_queue),
             "paused": self.paused,
             "prompt_preview": (self.prompt or "")[:200],
-            "context_preview": (self.context or "")[:200],
         }
 
 

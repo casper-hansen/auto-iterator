@@ -25,11 +25,6 @@ class RunConfig:
     extra_flags: tuple[str, ...]
     agent_cmd: str = "agent"
     backend: str = "cursor"
-    # Optional operator-supplied prose that travels alongside ``task`` into
-    # every review prompt. Defaults to empty; ``ai set-context`` swaps this
-    # between boundaries. When empty, the review prompt omits the context
-    # block entirely (see ``build_review_prompt._format_context``).
-    context: str = ""
 
     @property
     def agent_kw(self) -> dict:
@@ -53,7 +48,6 @@ class RunConfig:
         """Ordered dict of label→value pairs for the startup banner."""
         return {
             "task": self.task,
-            "context": self.context or "(none)",
             "impl_model": self.impl_model,
             "fix_model": self.fix_model,
             "reviewer_model": self.reviewer_model,

@@ -53,7 +53,6 @@ def _make_cfg(workspace: str, *, max_outer=1, max_inner=2, skip_impl=True) -> Ru
         extra_flags=(),
         agent_cmd=str(MOCK),
         backend="cursor",
-        context="",
     )
 
 

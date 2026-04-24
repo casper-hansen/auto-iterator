@@ -38,8 +38,7 @@ def compose_review_prompt(
     task: str,
     history: list[dict[str, str]],
     *,
-    context: str = "",
-    guidance: list[str] | None = None,
+    guidance: list[str],
 ) -> str:
     """Build the review prompt, honouring any backend-specific template.
 
@@ -51,8 +50,8 @@ def compose_review_prompt(
     be = get_backend(cfg.backend)
     build_prompt = getattr(be, "build_review_prompt", None)
     if build_prompt is not None:
-        return build_prompt(task, history, context=context, guidance=guidance)
-    return build_review_prompt(task, history, context=context, guidance=guidance)
+        return build_prompt(task, history, guidance=guidance)
+    return build_review_prompt(task, history, guidance=guidance)
 
 
 async def run_review(
@@ -60,24 +59,21 @@ async def run_review(
     history: list[dict[str, str]],
     tag: str,
     *,
-    task: str | None = None,
-    context: str | None = None,
-    guidance: list[str] | None = None,
+    task: str,
+    guidance: list[str],
 ) -> tuple[str, str]:
     """Run a review agent, append its output to *history*, return
     ``(verdict, review_text)``.
 
-    ``task`` / ``context`` / ``guidance`` default to the values on *cfg*
-    when callers don't want live mutation (existing call sites). The
-    runner passes through runtime-mutable values so operator intents
+    ``task`` and ``guidance`` are the runtime-mutable values sourced from
+    ``RunState`` — the runner passes them through so operator intents
     dropped between boundaries take effect on the very next review."""
     log(f"Review — {CYAN}{cfg.reviewer_model}{NC}", tag)
 
     prompt = compose_review_prompt(
         cfg,
-        task=task if task is not None else cfg.task,
+        task=task,
         history=history,
-        context=context if context is not None else cfg.context,
         guidance=guidance,
     )
 

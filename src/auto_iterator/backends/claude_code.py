@@ -87,21 +87,17 @@ def _tool_use_summary(block: dict) -> str:
     return f"{name}({_truncate(s, 160)})" if s != "{}" else name
 
 
-def _render_operator_extras(context: str, guidance: list[str]) -> str:
-    """Render operator-supplied context + guidance as a single markdown
-    block. Returns an empty string when both are empty so the skill
-    template collapses cleanly."""
-    parts: list[str] = []
-    ctx = (context or "").strip()
-    if ctx:
-        parts.append(f"## Additional context\n\n{ctx}")
-    if guidance:
-        bullets = "\n".join(f"- {g}" for g in guidance)
-        parts.append(
-            "## Operator guidance (apply on top of the task above)\n\n"
-            f"{bullets}"
-        )
-    return "\n\n".join(parts)
+def _render_operator_extras(guidance: list[str]) -> str:
+    """Render operator-supplied guidance as a markdown block. Returns an
+    empty string when there's no guidance so the skill template collapses
+    cleanly."""
+    if not guidance:
+        return ""
+    bullets = "\n".join(f"- {g}" for g in guidance)
+    return (
+        "## Operator guidance (apply on top of the task above)\n\n"
+        f"{bullets}"
+    )
 
 
 def _render_history_block(history: list[dict[str, str]]) -> str:
@@ -209,17 +205,16 @@ class ClaudeCodeBackend:
         task: str,
         history: list[dict[str, str]],
         *,
-        context: str = "",
         guidance: list[str] | None = None,
     ) -> str:
         """Review prompt driven by ``skills/claude-review.md``.
 
         Dispatches an ``/ultrareview``-style multi-agent review against
         the local branch diff, substituting the task, prior review
-        history, and any operator extras (context / guidance) into the
-        skill template. Extras land *before* the terminal "VERDICT on its
-        own line, nothing after it" instruction so they don't defeat the
-        skill's output contract."""
+        history, and any operator guidance into the skill template.
+        Guidance lands *before* the terminal "VERDICT on its own line,
+        nothing after it" instruction so it doesn't defeat the skill's
+        output contract."""
         skill = _SKILL_PATH.read_text(encoding="utf-8")
         return (
             skill
@@ -227,7 +222,7 @@ class ClaudeCodeBackend:
             .replace("{{HISTORY_BLOCK}}", _render_history_block(history))
             .replace(
                 "{{OPERATOR_EXTRAS_BLOCK}}",
-                _render_operator_extras(context, guidance or []),
+                _render_operator_extras(guidance or []),
             )
         )
 

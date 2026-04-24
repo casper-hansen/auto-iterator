@@ -1,7 +1,7 @@
 """Unit tests for the control-file drain.
 
-Exercises every intent type (guidance, rewind, prompt, context, pause)
-in isolation from the runner. The drain is the single bottleneck through
+Exercises every intent type (guidance, rewind, prompt, pause) in
+isolation from the runner. The drain is the single bottleneck through
 which every operator intent flows, so we hit the happy paths *and* the
 edge cases (two guidance writes in the same window, malformed rewind,
 missing-file no-ops, phase=after_impl normalisation)."""
@@ -24,7 +24,6 @@ from auto_iterator.control import (  # noqa: E402
 )
 from auto_iterator.events import EventLog, RunState  # noqa: E402
 from auto_iterator.run_dir import (  # noqa: E402
-    CTL_CONTEXT,
     CTL_GUIDANCE,
     CTL_PAUSE,
     CTL_PROMPT,
@@ -37,8 +36,7 @@ from auto_iterator.run_dir import (  # noqa: E402
 def _setup(tmp: Path):
     paths = create_run_dir(tmp, new_run_id())
     state = RunState(run_id=paths.run_id, prompt="orig prompt",
-                     context="orig context", workspace="/tmp/ws",
-                     outer=2, inner=3)
+                     workspace="/tmp/ws", outer=2, inner=3)
     log = EventLog(paths, state)
     return paths, state, log
 
@@ -52,7 +50,6 @@ def test_drain_noop_when_empty() -> None:
         # events.jsonl's file existence is OK since EventLog may seed
         # nothing; we assert no mutation happened).
         assert state.prompt == "orig prompt"
-        assert state.context == "orig context"
         assert state.guidance_queue == []
     print("  test_drain_noop_when_empty PASS")
 
@@ -91,17 +88,14 @@ def test_drain_guidance_multi_concurrent() -> None:
     print("  test_drain_guidance_multi_concurrent PASS")
 
 
-def test_drain_prompt_and_context() -> None:
+def test_drain_prompt() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         paths, state, log = _setup(Path(tmp))
         paths.control_file(CTL_PROMPT).write_text("new prompt text")
-        paths.control_file(CTL_CONTEXT).write_text("new context blob")
         drain_control(paths, state, log)
         assert state.prompt == "new prompt text"
-        assert state.context == "new context blob"
         assert not paths.control_file(CTL_PROMPT).exists()
-        assert not paths.control_file(CTL_CONTEXT).exists()
-    print("  test_drain_prompt_and_context PASS")
+    print("  test_drain_prompt PASS")
 
 
 def test_drain_rewind_valid_phases() -> None:
@@ -189,7 +183,7 @@ def test_drain_rewind_concurrent_rewrite_survives() -> None:
             "outer": 5, "inner": 7, "phase": "fix",
         }
 
-        state2 = RunState(run_id=paths.run_id, prompt="", context="",
+        state2 = RunState(run_id=paths.run_id, prompt="",
                           workspace="/tmp/ws", outer=0, inner=0)
         log2 = EventLog(paths, state2)
         intent2 = drain_control(paths, state2, log2)
@@ -251,12 +245,12 @@ def test_wait_while_paused_returns_quick_when_no_pause() -> None:
 
 def main() -> None:
     print("=" * 60)
-    print("Test: control-file drain (guidance / prompt / context / rewind / pause)")
+    print("Test: control-file drain (guidance / prompt / rewind / pause)")
     print("-" * 60)
     test_drain_noop_when_empty()
     test_drain_guidance_single()
     test_drain_guidance_multi_concurrent()
-    test_drain_prompt_and_context()
+    test_drain_prompt()
     test_drain_rewind_valid_phases()
     test_drain_rewind_after_impl_normalizes()
     test_drain_rewind_malformed_rejected()

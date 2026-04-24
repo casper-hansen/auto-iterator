@@ -1,18 +1,12 @@
 """Prompt construction and verdict parsing for the review loop.
 
-Review prompts are built from four ingredients:
+Review prompts are built from three ingredients:
 
 1. The *task* (``cfg.task`` at boot; mutated via ``ai set-prompt``).
-2. Optional *context* — extra prose the operator wanted the reviewer to
-   see on every round (``cfg.context`` / ``ai set-context``).
-3. Accumulated review/fix *history* — the two most recent rounds, so the
+2. Accumulated review/fix *history* — the two most recent rounds, so the
    prompt stays focused without forgetting the immediately prior feedback.
-4. Pending operator *guidance* — one-shot steering text that lands in the
-   very next review and then clears.
-
-Keeping guidance separate from context is deliberate: context is sticky
-(survives rewind, applies to every round), guidance is ephemeral (applies
-once and is consumed)."""
+3. Pending operator *guidance* — one-shot steering text that lands in the
+   very next review and then clears."""
 
 from __future__ import annotations
 
@@ -52,18 +46,10 @@ def _format_guidance(guidance: list[str]) -> str:
     )
 
 
-def _format_context(context: str) -> str:
-    ctx = (context or "").strip()
-    if not ctx:
-        return ""
-    return f"\n\n--- Additional context ---\n\n{ctx}\n\n--- End context ---"
-
-
 def build_review_prompt(
     task: str,
     history: list[dict[str, str]],
     *,
-    context: str = "",
     guidance: list[str] | None = None,
 ) -> str:
     preamble = (
@@ -71,7 +57,6 @@ def build_review_prompt(
         "Review if we have made an excellent implementation of the following:\n\n"
         f"{task}"
     )
-    preamble += _format_context(context)
     preamble += _format_guidance(guidance or [])
     if history:
         preamble += (

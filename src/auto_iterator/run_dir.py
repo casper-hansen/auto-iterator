@@ -11,7 +11,7 @@ Design notes
   but every entry point accepts ``--runs-dir`` so tests can substitute a
   tmpdir.
 * Permissions are tight by default (``0700`` for dirs, ``0600`` for files)
-  because prompts and context can contain sensitive material.
+  because prompts can contain sensitive material.
 * Writes that matter (``meta.json``, ``state.json``, ``spec.json``,
   ``control/rewind.json``) go through :func:`atomic_write_json` which uses
   tmp + ``os.rename`` so a reader never sees a half-written file.
@@ -47,7 +47,6 @@ AGENT_LOG_FILE = "agent.log"
 CTL_GUIDANCE = "guidance.txt"
 CTL_REWIND = "rewind.json"
 CTL_PROMPT = "prompt.txt"
-CTL_CONTEXT = "context.txt"
 CTL_PAUSE = "pause"
 
 

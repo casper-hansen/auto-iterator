@@ -42,11 +42,6 @@ def _build_parser(be) -> argparse.ArgumentParser:
         "--task-file",
         help="Path to a UTF-8 text file containing the feature / task description",
     )
-    ctx_grp = p.add_mutually_exclusive_group()
-    ctx_grp.add_argument("--context", default="",
-                         help="Optional static context injected into every review.")
-    ctx_grp.add_argument("--context-file", default=None,
-                         help="Path to a UTF-8 text file with additional context.")
     p.add_argument("--impl-model", default=be.default_impl_model)
     p.add_argument("--fix-model", default=be.default_fix_model)
     p.add_argument(
@@ -79,7 +74,6 @@ def _parse_config(argv: list[str] | None):
         extra_flags=tuple(args.extra_flags),
         agent_cmd=os.environ.get("AGENT_CMD", be.default_cmd),
         backend=backend,
-        context=_load_text(args.context, args.context_file, "context"),
     )
     return cfg, args.runs_dir
 

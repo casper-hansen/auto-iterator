@@ -76,7 +76,6 @@ def spec_to_cfg(spec: dict) -> RunConfig:
         "extra_flags": tuple(spec.get("extra_flags", [])),
         "agent_cmd": spec.get("agent_cmd", "agent"),
         "backend": spec.get("backend", "cursor"),
-        "context": spec.get("context", ""),
     }
     return RunConfig(**kwargs)
 
@@ -168,7 +167,6 @@ class ReviewLoopRunner:
         self.state = RunState(
             run_id=paths.run_id,
             prompt=cfg.task,
-            context=cfg.context,
             workspace=cfg.workspace,
         )
         self.log = EventLog(paths, self.state)
@@ -421,7 +419,6 @@ class ReviewLoopRunner:
                 self.state.history,
                 tag,
                 task=self.state.prompt,
-                context=self.state.context,
                 guidance=guidance,
             )
             # Guidance is one-shot — clear after folding in.

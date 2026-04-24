@@ -28,8 +28,6 @@ def test_run_parser_basics() -> None:
     assert args.max_inner == 2
     # Default workspace is "."
     assert args.workspace == "."
-    # Context default empty
-    assert args.context == ""
     print("  test_run_parser_basics PASS")
 
 

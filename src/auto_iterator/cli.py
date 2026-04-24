@@ -9,8 +9,7 @@ Subcommand families
 -------------------
 * Spawn / lifecycle — ``run``, ``restart``, ``kill``.
 * Read — ``ls``, ``show``, ``tail``.
-* Mutate — ``send``, ``rewind``, ``set-prompt``, ``set-context``,
-  ``pause``, ``resume``.
+* Mutate — ``send``, ``rewind``, ``set-prompt``, ``pause``, ``resume``.
 
 Exit codes follow the spec:
 ``0`` success / ``1`` user error / ``2`` IO or permission error /
@@ -36,7 +35,6 @@ from .feature.config import RunConfig
 from .ls import list_runs, summarize_run
 from .meta import read_meta, update_meta
 from .run_dir import (
-    CTL_CONTEXT,
     CTL_GUIDANCE,
     CTL_PAUSE,
     CTL_PROMPT,
@@ -130,7 +128,6 @@ def _make_cfg_from_args(args: argparse.Namespace) -> RunConfig:
         extra_flags=tuple(args.extra_flags or []),
         agent_cmd=args.agent_cmd or os.environ.get("AGENT_CMD", be.default_cmd),
         backend=backend,
-        context=load_text_arg(args.context, args.context_file, "context"),
     )
     err = cfg.validate()
     if err:
@@ -161,9 +158,6 @@ def _build_parser() -> argparse.ArgumentParser:
     prompt_g = run_p.add_mutually_exclusive_group(required=True)
     prompt_g.add_argument("--prompt", help="Feature / task description.")
     prompt_g.add_argument("--prompt-file", help="Path to a UTF-8 prompt file.")
-    ctx_g = run_p.add_mutually_exclusive_group()
-    ctx_g.add_argument("--context", default="", help="Additional static context.")
-    ctx_g.add_argument("--context-file", help="Path to a UTF-8 context file.")
     run_p.add_argument("--impl-model", default=None)
     run_p.add_argument("--fix-model", default=None)
     run_p.add_argument("--reviewer", default=None, dest="reviewer_model")
@@ -242,15 +236,6 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_g.add_argument("--text")
     sp_g.add_argument("--prompt-file", dest="file")
     sp_p.add_argument("--wait", action="store_true")
-
-    # ── set-context ──
-    sc_p = sub.add_parser("set-context",
-                          help="Replace the review-loop's static context.")
-    sc_p.add_argument("run_id")
-    sc_g = sc_p.add_mutually_exclusive_group(required=True)
-    sc_g.add_argument("--text")
-    sc_g.add_argument("--context-file", dest="file")
-    sc_p.add_argument("--wait", action="store_true")
 
     # ── pause / resume ──
     pause_p = sub.add_parser("pause", help="Stall the runner at the next boundary.")
@@ -701,18 +686,6 @@ def cmd_set_prompt(args: argparse.Namespace, runs_dir: Path) -> int:
     return _drop_mutation(run, writer, wait_for_type=wait_for)
 
 
-def cmd_set_context(args: argparse.Namespace, runs_dir: Path) -> int:
-    run = _resolve_run(runs_dir, args.run_id)
-    try:
-        text = load_text_arg(args.text, args.file, "context")
-    except OSError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_IO_ERROR
-    writer = lambda: atomic_write_text(run.paths.control_file(CTL_CONTEXT), text)
-    wait_for = "context_updated" if args.wait else None
-    return _drop_mutation(run, writer, wait_for_type=wait_for)
-
-
 def cmd_pause(args: argparse.Namespace, runs_dir: Path) -> int:
     run = _resolve_run(runs_dir, args.run_id)
     try:
@@ -750,7 +723,6 @@ _COMMAND_MAP = {
     "send": cmd_send,
     "rewind": cmd_rewind,
     "set-prompt": cmd_set_prompt,
-    "set-context": cmd_set_context,
     "pause": cmd_pause,
     "resume": cmd_resume,
 }
