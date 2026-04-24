@@ -7,6 +7,7 @@ that surrounds it, so callers see only the semantic result.
 from __future__ import annotations
 
 from ..agent import run_agent
+from ..backends import get_backend
 from ..colors import BOLD, CYAN, GREEN, YELLOW, NC
 from .config import RunConfig
 from ..logging import hr, log, ok, warn
@@ -40,9 +41,17 @@ async def run_review(
     """Run a review agent, append its output to *history*, return the verdict."""
     log(f"Review — {CYAN}{cfg.reviewer_model}{NC}", tag)
 
+    be = get_backend(cfg.backend)
+    build_prompt = getattr(be, "build_review_prompt", None)
+    prompt = (
+        build_prompt(cfg.task, history)
+        if build_prompt is not None
+        else build_review_prompt(cfg.task, history)
+    )
+
     rc, review_text = await run_agent(
         model=cfg.reviewer_model,
-        prompt=build_review_prompt(cfg.task, history),
+        prompt=prompt,
         tag=tag, **cfg.agent_kw,
     )
     history.append({"role": "reviewer", "content": review_text})

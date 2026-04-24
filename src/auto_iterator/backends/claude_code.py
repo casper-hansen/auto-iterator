@@ -23,6 +23,7 @@ Event shapes consumed here (observed against claude 2.1.x):
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from ..tool_formatter import _shorten_path, _truncate
 
@@ -30,6 +31,17 @@ _RESUME_PROMPT = (
     "Your previous session ended unexpectedly before completing the task. "
     "Please continue where you left off."
 )
+
+# Review skill adapted from Claude Code's `/ultrareview` for local-branch
+# review (no GitHub PR). Resolved relative to the repo root so edits to
+# the markdown take effect on the next review call without a reinstall.
+_SKILL_PATH = (
+    Path(__file__).resolve().parents[3] / "skills" / "claude-review.md"
+)
+
+# Match the default reviewer's window — see `feature/prompts.py`.
+_HISTORY_ROUNDS = 2
+_HISTORY_ENTRIES = _HISTORY_ROUNDS * 2
 
 
 def _tool_use_summary(block: dict) -> str:
@@ -73,6 +85,23 @@ def _tool_use_summary(block: dict) -> str:
 
     s = json.dumps(inp, separators=(",", ":"))
     return f"{name}({_truncate(s, 160)})" if s != "{}" else name
+
+
+def _render_history_block(history: list[dict[str, str]]) -> str:
+    if not history:
+        return ""
+    recent = history[-_HISTORY_ENTRIES:]
+    parts: list[str] = []
+    for i, entry in enumerate(recent, 1):
+        label = "Review" if entry["role"] == "reviewer" else "Fix"
+        parts.append(f"### Round {i} — {label}\n\n{entry['content']}")
+    body = "\n\n".join(parts)
+    return (
+        "## Previous review cycle history (oldest first)\n\n"
+        "Verify prior concerns are fixed; also check for regressions or "
+        "new issues anywhere in the diff.\n\n"
+        f"{body}\n"
+    )
 
 
 def _tool_result_summary(block: dict) -> str:
@@ -157,6 +186,24 @@ class ClaudeCodeBackend:
         cmd.extend(extra_flags)
         cmd.append(_RESUME_PROMPT)
         return cmd
+
+    def build_review_prompt(
+        self,
+        task: str,
+        history: list[dict[str, str]],
+    ) -> str:
+        """Review prompt driven by ``skills/claude-review.md``.
+
+        Dispatches an ``/ultrareview``-style multi-agent review against
+        the local branch diff, substituting the task and any prior review
+        history into the skill template.
+        """
+        skill = _SKILL_PATH.read_text(encoding="utf-8")
+        return (
+            skill
+            .replace("{{TASK}}", task.strip())
+            .replace("{{HISTORY_BLOCK}}", _render_history_block(history))
+        )
 
     def handle_event(self, evt: dict, reader) -> None:
         etype = evt.get("type", "")
