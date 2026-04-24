@@ -11,10 +11,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from iterator_loop.backends import BACKENDS, get_backend
-from iterator_loop.experiment.config import ExperimentConfig
-from iterator_loop.colors import BOLD, DIM, GREEN, YELLOW, NC
-from iterator_loop.logging import banner, err, hr, log, ok, section, warn
+from auto_iterator.backends import BACKENDS, get_backend
+from auto_iterator.experiment.config import ExperimentConfig
+from auto_iterator.colors import BOLD, DIM, GREEN, YELLOW, NC
+from auto_iterator.logging import banner, err, hr, log, ok, section, warn
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ def _experiment_summary(
 
 
 async def main(argv: list[str] | None = None) -> int:
-    from iterator_loop.experiment.steps import (
+    from auto_iterator.experiment.steps import (
         run_adjustment,
         run_analysis,
         run_baseline,

@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from iterator_loop.agent import run_agent  # noqa: E402
+from auto_iterator.agent import run_agent  # noqa: E402
 
 MOCK_SCRIPT = Path(__file__).resolve().parent / "mock_agent.sh"
 

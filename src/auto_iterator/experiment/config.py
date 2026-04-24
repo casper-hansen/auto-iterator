@@ -1,8 +1,8 @@
 """ExperimentConfig dataclass — single object for all experiment loop configuration.
 
 Model defaults are owned by each backend (see
-``iterator_loop.backends.cursor.CursorBackend`` /
-``iterator_loop.backends.claude_code.ClaudeCodeBackend``), not by this
+``auto_iterator.backends.cursor.CursorBackend`` /
+``auto_iterator.backends.claude_code.ClaudeCodeBackend``), not by this
 module, because each CLI speaks to a different set of model names.
 """
 

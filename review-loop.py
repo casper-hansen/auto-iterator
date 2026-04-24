@@ -9,10 +9,10 @@ import os
 import sys
 from pathlib import Path
 
-from iterator_loop.backends import BACKENDS, get_backend
-from iterator_loop.feature.config import RunConfig
-from iterator_loop.logging import banner, err, log, make_tag, ok, section, summary, warn
-from iterator_loop.feature.steps import run_fix, run_implementation, run_review
+from auto_iterator.backends import BACKENDS, get_backend
+from auto_iterator.feature.config import RunConfig
+from auto_iterator.logging import banner, err, log, make_tag, ok, section, summary, warn
+from auto_iterator.feature.steps import run_fix, run_implementation, run_review
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

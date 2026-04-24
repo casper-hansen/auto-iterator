@@ -9,4 +9,4 @@ description = "Automated implement → review → fix loop using the Cursor CLI"
 requires-python = ">=3.9"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/iterator_loop"]
+packages = ["src/auto_iterator"]
