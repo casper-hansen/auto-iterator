@@ -17,11 +17,11 @@ async def run_implementation(cfg: RunConfig) -> None:
     """Run the implementation agent and log the outcome."""
     tag = f"{BOLD}[Impl]{NC}"
     log(f"Implementing feature with {CYAN}{cfg.impl_model}{NC}", tag)
-    log(f"Prompt: {cfg.prompt[:120]}...", tag)
+    log(f"Task: {cfg.task[:120]}...", tag)
     print()
 
     rc, _ = await run_agent(
-        model=cfg.impl_model, prompt=cfg.prompt,
+        model=cfg.impl_model, prompt=cfg.task,
         tag=tag, **cfg.agent_kw,
     )
     if rc == 0:
@@ -42,7 +42,7 @@ async def run_review(
 
     rc, review_text = await run_agent(
         model=cfg.reviewer_model,
-        prompt=build_review_prompt(cfg.prompt, cfg.context, history),
+        prompt=build_review_prompt(cfg.task, history),
         tag=tag, **cfg.agent_kw,
     )
     history.append({"role": "reviewer", "content": review_text})
@@ -72,7 +72,7 @@ async def run_fix(
 
     rc, fix_text = await run_agent(
         model=cfg.fix_model,
-        prompt=build_fix_prompt(cfg.prompt, cfg.context, history),
+        prompt=build_fix_prompt(),
         tag=tag, **cfg.agent_kw,
     )
     history.append({"role": "fixer", "content": fix_text})

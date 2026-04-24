@@ -24,17 +24,11 @@ def _build_parser(be) -> argparse.ArgumentParser:
         prog="review-loop",
         description="Automated implement → review → fix loop",
     )
-    prompt_grp = p.add_mutually_exclusive_group(required=True)
-    prompt_grp.add_argument("--prompt", help="Feature / task description")
-    prompt_grp.add_argument(
-        "--prompt-file",
+    task_grp = p.add_mutually_exclusive_group(required=True)
+    task_grp.add_argument("--task", help="Feature / task description")
+    task_grp.add_argument(
+        "--task-file",
         help="Path to a UTF-8 text file containing the feature / task description",
-    )
-    ctx_grp = p.add_mutually_exclusive_group()
-    ctx_grp.add_argument("--context", default="", help="Extra context for reviewers")
-    ctx_grp.add_argument(
-        "--context-file",
-        help="Path to a UTF-8 text file containing extra reviewer context",
     )
     p.add_argument("--impl-model", default=be.default_impl_model)
     p.add_argument("--fix-model", default=be.default_fix_model)
@@ -69,8 +63,7 @@ def _parse_config(argv: list[str] | None) -> RunConfig:
     be = get_backend(backend)
     args = _build_parser(be).parse_args(argv)
     return RunConfig(
-        prompt=_load_text(args.prompt, args.prompt_file, "prompt"),
-        context=_load_text(args.context, args.context_file, "context"),
+        task=_load_text(args.task, args.task_file, "task"),
         impl_model=args.impl_model,
         fix_model=args.fix_model or args.impl_model,
         reviewer_model=args.reviewer_model,

@@ -14,8 +14,7 @@ from datetime import datetime, timezone
 
 @dataclass(frozen=True)
 class RunConfig:
-    prompt: str
-    context: str
+    task: str
     impl_model: str
     fix_model: str
     reviewer_model: str
@@ -48,8 +47,7 @@ class RunConfig:
     def banner_items(self) -> dict[str, object]:
         """Ordered dict of label→value pairs for the startup banner."""
         return {
-            "prompt": self.prompt,
-            "context": self.context,
+            "task": self.task,
             "impl_model": self.impl_model,
             "fix_model": self.fix_model,
             "reviewer_model": self.reviewer_model,
