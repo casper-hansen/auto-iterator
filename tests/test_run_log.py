@@ -204,17 +204,6 @@ def test_tail_ring_buffer_caps_at_tail_size() -> None:
 
 
 def test_tool_call_events_update_pending_tools_and_last_tool() -> None:
-    """``tool_call_*`` events carry the raw stream-json ``tool_call``
-    payload so ``events.jsonl`` is the full-output source of truth;
-    the state.json renderer derives the at-a-glance ``summary`` from
-    that raw payload. This test locks in both halves:
-
-    1. The emitted event is preserved verbatim in ``events.jsonl``
-       (full ``args`` / ``result`` round-trip).
-    2. ``state.agent.last_tool.summary`` is correctly re-rendered by
-       :func:`iterator_loop.run_log._render_last_tool` from that raw
-       payload — not copied from a pre-computed field.
-    """
     with tempfile.TemporaryDirectory() as tmp:
         logger = RunLogger(root_dir=tmp)
         logger.emit("agent_session_started", {"model": "m1", "attempt": 0, "max_resume_attempts": 3})
@@ -222,56 +211,17 @@ def test_tool_call_events_update_pending_tools_and_last_tool() -> None:
         _assert(state["agent"]["session_active"] is True, "session_active flag not set")
         _assert(state["agent"]["model"] == "m1", "agent.model not captured")
 
-        started_tc = {"shellToolCall": {"args": {"command": "ls"}}}
-        logger.emit(
-            "tool_call_started",
-            {"name": "shell", "tool_call": started_tc},
-        )
+        logger.emit("tool_call_started", {"name": "shell", "summary": "shell: ls"})
         state = _read_state(logger.state_path)
         _assert(state["agent"]["pending_tools"] == 1, "pending_tools not incremented")
         _assert(state["agent"]["last_tool"]["phase"] == "started", "last_tool.phase wrong")
         _assert(state["agent"]["last_tool"]["summary"] == "shell: ls",
-                f"last_tool.summary should be derived from raw tool_call, "
-                f"got {state['agent']['last_tool']['summary']!r}")
+                "last_tool.summary missing")
 
-        completed_tc = {
-            "shellToolCall": {
-                "args": {"command": "ls"},
-                "result": {"success": {"exitCode": 0, "stdout": ""}},
-            },
-        }
-        logger.emit(
-            "tool_call_completed",
-            {"name": "shell", "tool_call": completed_tc},
-        )
+        logger.emit("tool_call_completed", {"name": "shell", "summary": "shell ✓ exit 0"})
         state = _read_state(logger.state_path)
         _assert(state["agent"]["pending_tools"] == 0, "pending_tools not decremented")
         _assert(state["agent"]["last_tool"]["phase"] == "completed", "last_tool.phase wrong")
-        _assert(
-            state["agent"]["last_tool"]["summary"] is not None
-            and "shell" in state["agent"]["last_tool"]["summary"]
-            and "exit 0" in state["agent"]["last_tool"]["summary"],
-            f"completed last_tool.summary should render result from raw "
-            f"tool_call, got {state['agent']['last_tool']['summary']!r}",
-        )
-
-        # events.jsonl is the full-output source of truth: the raw
-        # tool_call payload must round-trip verbatim.
-        events = _read_events(logger.events_path)
-        started_event = next(e for e in events if e["type"] == "tool_call_started")
-        completed_event = next(e for e in events if e["type"] == "tool_call_completed")
-        _assert(started_event.get("tool_call") == started_tc,
-                f"tool_call_started must preserve raw tool_call payload, "
-                f"got {started_event.get('tool_call')!r}")
-        _assert(completed_event.get("tool_call") == completed_tc,
-                f"tool_call_completed must preserve raw tool_call payload, "
-                f"got {completed_event.get('tool_call')!r}")
-        _assert("summary" not in started_event,
-                f"tool_call events must NOT carry a pre-rendered summary; "
-                f"the renderer derives it from tool_call: {started_event}")
-        _assert("summary" not in completed_event,
-                f"tool_call events must NOT carry a pre-rendered summary; "
-                f"the renderer derives it from tool_call: {completed_event}")
 
         logger.emit("agent_result", {"text": "final",
                                      "usage": {"input_tokens": 10, "output_tokens": 5},

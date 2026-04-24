@@ -223,23 +223,19 @@ class _StreamReader:
             tool_name = _tool_name(tc)
             if sub == "started":
                 self.pending_tools += 1
-                # The human-facing terminal renderer formats the tool
-                # call inline, but ``events.jsonl`` gets the raw
-                # ``tool_call`` payload so consumers (state.json
-                # renderer, future TUI, post-mortem analysis) can
-                # re-render it however they like instead of being
-                # locked into the one-line summary format.
-                self._fmt.feed_tool(f"→ {tool_summary(tc)}")
+                summary = tool_summary(tc)
+                self._fmt.feed_tool(f"→ {summary}")
                 self._emit(
                     "tool_call_started",
-                    {"name": tool_name, "tool_call": tc},
+                    {"name": tool_name, "summary": summary},
                 )
             elif sub == "completed":
                 self.pending_tools = max(0, self.pending_tools - 1)
-                self._fmt.feed_tool(f"← {tool_summary(tc, completed=True)}")
+                summary = tool_summary(tc, completed=True)
+                self._fmt.feed_tool(f"← {summary}")
                 self._emit(
                     "tool_call_completed",
-                    {"name": tool_name, "tool_call": tc},
+                    {"name": tool_name, "summary": summary},
                 )
 
         elif etype == "result":

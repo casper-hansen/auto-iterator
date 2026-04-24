@@ -41,8 +41,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .tool_formatter import tool_summary
-
 
 SCHEMA_VERSION = 1
 DEFAULT_TAIL_SIZE = 40
@@ -928,12 +926,20 @@ class RunLogger:
 
         if et == "tool_call_started":
             agent["pending_tools"] += 1
-            agent["last_tool"] = _render_last_tool("started", payload)
+            agent["last_tool"] = {
+                "phase": "started",
+                "name": payload.get("name"),
+                "summary": payload.get("summary"),
+            }
             return
 
         if et == "tool_call_completed":
             agent["pending_tools"] = max(0, agent["pending_tools"] - 1)
-            agent["last_tool"] = _render_last_tool("completed", payload)
+            agent["last_tool"] = {
+                "phase": "completed",
+                "name": payload.get("name"),
+                "summary": payload.get("summary"),
+            }
             return
 
         if et == "assistant_partial":
@@ -977,37 +983,6 @@ class RunLogger:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
-
-
-def _render_last_tool(phase: str, payload: dict) -> dict:
-    """Render a ``state.agent.last_tool`` view from a tool-call event.
-
-    ``events.jsonl`` is the full-output source of truth, so a
-    ``tool_call_started`` / ``tool_call_completed`` event carries the
-    raw ``tool_call`` payload the agent emitted (stream-json
-    ``{"shellToolCall": {"args": …, "result": …}}`` and friends). The
-    one-line ``summary`` that previously shipped inside the event has
-    been demoted to a pure rendering concern: derive it here so
-    ``state.json`` keeps its at-a-glance snapshot without forcing the
-    machine-readable log to store pre-rendered strings that a future
-    consumer (a richer TUI, a post-mortem analysis, …) would have to
-    re-parse to get back at the underlying args/result.
-
-    ``summary`` in the payload is still honoured as a fallback so tests
-    that predate the schema change — and any caller that emits a
-    ``tool_call_*`` event by hand with a pre-rendered summary — keep
-    working unchanged.
-    """
-    tc = payload.get("tool_call")
-    if isinstance(tc, dict):
-        summary = tool_summary(tc, completed=(phase == "completed"))
-    else:
-        summary = payload.get("summary")
-    return {
-        "phase": phase,
-        "name": payload.get("name"),
-        "summary": summary,
-    }
 
 
 _CONFIG_ALLOWLIST = {
