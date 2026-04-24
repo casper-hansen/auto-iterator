@@ -9,11 +9,13 @@ come back into the generic ``_StreamReader`` state the loop cares about
 from __future__ import annotations
 
 from .claude_code import ClaudeCodeBackend
+from .codex import CodexBackend
 from .cursor import CursorBackend
 
 BACKENDS = {
     "cursor": CursorBackend(),
     "claude-code": ClaudeCodeBackend(),
+    "codex": CodexBackend(),
 }
 
 
@@ -27,4 +29,10 @@ def get_backend(name: str):
         ) from None
 
 
-__all__ = ["BACKENDS", "ClaudeCodeBackend", "CursorBackend", "get_backend"]
+__all__ = [
+    "BACKENDS",
+    "ClaudeCodeBackend",
+    "CodexBackend",
+    "CursorBackend",
+    "get_backend",
+]
