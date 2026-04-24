@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""review-loop.py — Automated implement → review → fix loop using the Cursor CLI."""
+"""review-loop.py — foreground entry point for the review loop.
+
+Back-compat shim: the loop's semantics now live in
+``auto_iterator.runner`` and every invocation (foreground or detached)
+creates a run-dir under ``~/.auto-iterator/runs/`` (or
+``$AUTO_ITERATOR_RUNS_DIR``) so ``ai ls`` / ``ai tail`` can observe the
+run while it's in flight.
+
+For operators who prefer the detached workflow, the recommended entry
+point is now ``ai run --prompt …`` (see ``ai --help``).
+"""
 
 from __future__ import annotations
 
@@ -10,9 +20,11 @@ import sys
 from pathlib import Path
 
 from auto_iterator.backends import BACKENDS, get_backend
+from auto_iterator.cli import load_text_arg as _load_text
 from auto_iterator.feature.config import RunConfig
-from auto_iterator.logging import banner, err, log, make_tag, ok, section, summary, warn
-from auto_iterator.feature.steps import run_fix, run_implementation, run_review
+from auto_iterator.logging import err
+from auto_iterator.run_dir import create_run_dir, new_run_id, resolve_runs_dir
+from auto_iterator.runner import run_review_loop_sync
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -30,6 +42,11 @@ def _build_parser(be) -> argparse.ArgumentParser:
         "--task-file",
         help="Path to a UTF-8 text file containing the feature / task description",
     )
+    ctx_grp = p.add_mutually_exclusive_group()
+    ctx_grp.add_argument("--context", default="",
+                         help="Optional static context injected into every review.")
+    ctx_grp.add_argument("--context-file", default=None,
+                         help="Path to a UTF-8 text file with additional context.")
     p.add_argument("--impl-model", default=be.default_impl_model)
     p.add_argument("--fix-model", default=be.default_fix_model)
     p.add_argument(
@@ -40,29 +57,17 @@ def _build_parser(be) -> argparse.ArgumentParser:
     p.add_argument("--workspace", default=".")
     p.add_argument("--skip-impl", action="store_true")
     p.add_argument("--extra-flags", action="append", default=[])
+    p.add_argument("--runs-dir", default=None,
+                   help="Override the per-user runs dir (default: "
+                        "$AUTO_ITERATOR_RUNS_DIR or ~/.auto-iterator/runs).")
     return p
 
 
-def _load_text(
-    inline: str | None,
-    file_path: str | None,
-    label: str,
-) -> str:
-    """Resolve a --foo / --foo-file pair to a string."""
-    if file_path:
-        p = Path(file_path).expanduser()
-        try:
-            return p.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise OSError(f"Could not read --{label}-file '{p}': {exc}") from exc
-    return (inline or "").strip()
-
-
-def _parse_config(argv: list[str] | None) -> RunConfig:
+def _parse_config(argv: list[str] | None):
     backend = os.environ.get("AGENT_BACKEND", "cursor")
     be = get_backend(backend)
     args = _build_parser(be).parse_args(argv)
-    return RunConfig(
+    cfg = RunConfig(
         task=_load_text(args.task, args.task_file, "task"),
         impl_model=args.impl_model,
         fix_model=args.fix_model or args.impl_model,
@@ -74,7 +79,9 @@ def _parse_config(argv: list[str] | None) -> RunConfig:
         extra_flags=tuple(args.extra_flags),
         agent_cmd=os.environ.get("AGENT_CMD", be.default_cmd),
         backend=backend,
+        context=_load_text(args.context, args.context_file, "context"),
     )
+    return cfg, args.runs_dir
 
 
 async def _command_exists(cmd: str) -> bool:
@@ -93,9 +100,9 @@ async def _command_exists(cmd: str) -> bool:
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 
-async def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     try:
-        cfg = _parse_config(argv)
+        cfg, runs_dir_override = _parse_config(argv)
     except OSError as exc:
         err(str(exc))
         return 1
@@ -109,86 +116,18 @@ async def main(argv: list[str] | None = None) -> int:
         return 1
 
     be = get_backend(cfg.backend)
-    if not await _command_exists(cfg.agent_cmd):
+    if not asyncio.run(_command_exists(cfg.agent_cmd)):
         err(f"{be.display_name} not found ('{cfg.agent_cmd}').")
         print(be.install_hint)
         return 1
 
-    banner("Review Loop", cfg.banner_items())
-
-    if not cfg.skip_impl:
-        await run_implementation(cfg)
-    else:
-        log("Skipping implementation (--skip-impl)")
-        print()
-
-    approved = False
-    total_reviews = 0
-    verdict = ""
-    outer = 0
-
-    for outer in range(1, cfg.max_outer + 1):
-        section(f"Outer Loop {outer}/{cfg.max_outer} — fresh context")
-
-        history: list[dict[str, str]] = []
-        inner = 0
-
-        for inner in range(1, cfg.max_inner + 1):
-            total_reviews += 1
-            tag = make_tag(outer, inner)
-
-            verdict = await run_review(cfg, history, tag)
-            print()
-
-            if verdict == "APPROVED":
-                ok("Reviewer approved", tag)
-                break
-
-            if inner == cfg.max_inner:
-                warn(f"Inner loop exhausted ({cfg.max_inner} iterations)", tag)
-                break
-
-            await run_fix(cfg, history, tag)
-            print()
-
-        if verdict != "APPROVED":
-            warn(
-                f"Inner loop did not reach approval after {cfg.max_inner} "
-                "iteration(s) — outer loop will retry with fresh context",
-            )
-            print()
-            continue
-
-        if inner == 1:
-            approved = True
-            ok("Approved on first pass" if outer == 1
-               else f"Fresh-eyes review approved on outer loop {outer}")
-            break
-
-        ok(
-            f"Inner loop converged after {inner} iteration(s) — "
-            "starting fresh-eyes validation in next outer loop",
-        )
-        print()
-
-    if not approved:
-        if verdict == "APPROVED":
-            warn(
-                f"Inner loop converged but MAX_OUTER ({cfg.max_outer}) exhausted "
-                "without a clean fresh-eyes pass"
-            )
-        else:
-            warn(f"Exhausted {cfg.max_outer} outer loop(s) without reaching approval")
-
-    summary(
-        approved=approved,
-        total_reviews=total_reviews,
-        outer_loops=outer,
-        max_outer=cfg.max_outer,
-        max_inner=cfg.max_inner,
-    )
-    return 0 if approved else 1
+    runs_dir = resolve_runs_dir(runs_dir_override)
+    paths = create_run_dir(runs_dir, new_run_id())
+    print(f"run_id: {paths.run_id}  (dir: {paths.run_dir})", file=sys.stderr)
+    from auto_iterator.runner import bootstrap_run
+    bootstrap_run(paths, cfg, pid=os.getpid(), agent_type="review-loop")
+    return run_review_loop_sync(cfg, paths, agent_type="review-loop")
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(main())

@@ -33,20 +33,52 @@ async def run_implementation(cfg: RunConfig) -> None:
     print()
 
 
+def compose_review_prompt(
+    cfg: RunConfig,
+    task: str,
+    history: list[dict[str, str]],
+    *,
+    context: str = "",
+    guidance: list[str] | None = None,
+) -> str:
+    """Build the review prompt, honouring any backend-specific template.
+
+    Backends that ship their own ``build_review_prompt`` (e.g. Claude Code
+    dispatches ``/ultrareview`` via a markdown skill) take the extras
+    directly so they can place them inside the template, *before* any
+    terminal output-format instructions. The default path builds the
+    whole prompt itself."""
+    be = get_backend(cfg.backend)
+    build_prompt = getattr(be, "build_review_prompt", None)
+    if build_prompt is not None:
+        return build_prompt(task, history, context=context, guidance=guidance)
+    return build_review_prompt(task, history, context=context, guidance=guidance)
+
+
 async def run_review(
     cfg: RunConfig,
     history: list[dict[str, str]],
     tag: str,
-) -> str:
-    """Run a review agent, append its output to *history*, return the verdict."""
+    *,
+    task: str | None = None,
+    context: str | None = None,
+    guidance: list[str] | None = None,
+) -> tuple[str, str]:
+    """Run a review agent, append its output to *history*, return
+    ``(verdict, review_text)``.
+
+    ``task`` / ``context`` / ``guidance`` default to the values on *cfg*
+    when callers don't want live mutation (existing call sites). The
+    runner passes through runtime-mutable values so operator intents
+    dropped between boundaries take effect on the very next review."""
     log(f"Review — {CYAN}{cfg.reviewer_model}{NC}", tag)
 
-    be = get_backend(cfg.backend)
-    build_prompt = getattr(be, "build_review_prompt", None)
-    prompt = (
-        build_prompt(cfg.task, history)
-        if build_prompt is not None
-        else build_review_prompt(cfg.task, history)
+    prompt = compose_review_prompt(
+        cfg,
+        task=task if task is not None else cfg.task,
+        history=history,
+        context=context if context is not None else cfg.context,
+        guidance=guidance,
     )
 
     rc, review_text = await run_agent(
@@ -58,7 +90,7 @@ async def run_review(
 
     if rc != 0:
         warn(f"Reviewer agent exited with rc={rc}", tag)
-        return "CHANGES_NEEDED"
+        return "CHANGES_NEEDED", review_text
 
     verdict = parse_verdict(review_text)
     if verdict == "APPROVED":
@@ -68,15 +100,18 @@ async def run_review(
     else:
         warn("Could not parse verdict — treating as CHANGES_NEEDED", tag)
         verdict = "CHANGES_NEEDED"
-    return verdict
+    return verdict, review_text
 
 
 async def run_fix(
     cfg: RunConfig,
     history: list[dict[str, str]],
     tag: str,
-) -> None:
-    """Run a fix agent and append its output to *history*."""
+) -> tuple[int, str]:
+    """Run a fix agent and append its output to *history*.
+
+    Returns ``(rc, fix_text)`` so the runner can emit a ``fix_finished``
+    event carrying the real exit code instead of guessing."""
     log(f"Fixing issues — {CYAN}{cfg.fix_model}{NC}", tag)
 
     rc, fix_text = await run_agent(
@@ -90,3 +125,4 @@ async def run_fix(
         ok("Fixes applied", tag)
     else:
         warn(f"Fix agent exited with rc={rc}", tag)
+    return rc, fix_text

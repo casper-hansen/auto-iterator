@@ -3,10 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "review-loop"
-version = "0.1.0"
-description = "Automated implement → review → fix loop using the Cursor CLI"
+name = "auto-iterator"
+version = "0.2.0"
+description = "Automated implement → review → fix loop with a filesystem-backed operator CLI"
 requires-python = ">=3.9"
+
+[project.scripts]
+ai = "auto_iterator.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/auto_iterator"]

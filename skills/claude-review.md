@@ -10,6 +10,8 @@ the local diff directly.
 
 {{HISTORY_BLOCK}}
 
+{{OPERATOR_EXTRAS_BLOCK}}
+
 ## Steps
 
 Follow these steps precisely.

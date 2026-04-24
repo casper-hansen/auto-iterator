@@ -87,6 +87,23 @@ def _tool_use_summary(block: dict) -> str:
     return f"{name}({_truncate(s, 160)})" if s != "{}" else name
 
 
+def _render_operator_extras(context: str, guidance: list[str]) -> str:
+    """Render operator-supplied context + guidance as a single markdown
+    block. Returns an empty string when both are empty so the skill
+    template collapses cleanly."""
+    parts: list[str] = []
+    ctx = (context or "").strip()
+    if ctx:
+        parts.append(f"## Additional context\n\n{ctx}")
+    if guidance:
+        bullets = "\n".join(f"- {g}" for g in guidance)
+        parts.append(
+            "## Operator guidance (apply on top of the task above)\n\n"
+            f"{bullets}"
+        )
+    return "\n\n".join(parts)
+
+
 def _render_history_block(history: list[dict[str, str]]) -> str:
     if not history:
         return ""
@@ -191,18 +208,27 @@ class ClaudeCodeBackend:
         self,
         task: str,
         history: list[dict[str, str]],
+        *,
+        context: str = "",
+        guidance: list[str] | None = None,
     ) -> str:
         """Review prompt driven by ``skills/claude-review.md``.
 
         Dispatches an ``/ultrareview``-style multi-agent review against
-        the local branch diff, substituting the task and any prior review
-        history into the skill template.
-        """
+        the local branch diff, substituting the task, prior review
+        history, and any operator extras (context / guidance) into the
+        skill template. Extras land *before* the terminal "VERDICT on its
+        own line, nothing after it" instruction so they don't defeat the
+        skill's output contract."""
         skill = _SKILL_PATH.read_text(encoding="utf-8")
         return (
             skill
             .replace("{{TASK}}", task.strip())
             .replace("{{HISTORY_BLOCK}}", _render_history_block(history))
+            .replace(
+                "{{OPERATOR_EXTRAS_BLOCK}}",
+                _render_operator_extras(context, guidance or []),
+            )
         )
 
     def handle_event(self, evt: dict, reader) -> None:
