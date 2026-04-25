@@ -1,12 +1,13 @@
 """Prompt construction and verdict parsing for the review loop.
 
-Review prompts are built from three ingredients:
+Review and fix prompts are built from the same set of ingredients:
 
 1. The *task* (``cfg.task`` at boot; mutated via ``ai set-prompt``).
 2. Accumulated review/fix *history* — the two most recent rounds, so the
    prompt stays focused without forgetting the immediately prior feedback.
 3. Pending operator *guidance* — one-shot steering text that lands in the
-   very next review and then clears."""
+   very next review and then clears (review prompts only; the fix agent
+   sees guidance indirectly through the review it's addressing)."""
 
 from __future__ import annotations
 
@@ -74,5 +75,45 @@ def build_review_prompt(
     )
 
 
-def build_fix_prompt() -> str:
-    return "Here are the latest changes addressing your review."
+def build_fix_prompt(
+    task: str,
+    history: list[dict[str, str]],
+) -> str:
+    """Build the prompt sent to the fix agent.
+
+    The fix agent runs in a fresh session with no carryover from the
+    implementer or the reviewer, so it must be handed everything it
+    needs to act:
+
+    * the *task* the implementation is aiming at,
+    * the *latest review* it's addressing (surfaced explicitly so the
+      agent doesn't have to guess which entry is "current"), and
+    * the immediately prior review/fix rounds for continuity, so the
+      agent can see what was already tried and avoid undoing it.
+
+    *history* must end with a reviewer entry — the runner only invokes
+    the fix step after a ``CHANGES_NEEDED`` review, so this is a true
+    invariant; raising here surfaces caller bugs loudly instead of
+    silently producing a malformed prompt."""
+    if not history:
+        raise ValueError("build_fix_prompt requires a non-empty history")
+    if history[-1]["role"] != "reviewer":
+        raise ValueError(
+            "build_fix_prompt expects history to end with a reviewer entry; "
+            f"got role={history[-1]['role']!r}"
+        )
+
+    latest_review = history[-1]["content"]
+    prior = history[:-1]
+
+    parts = [
+        "Here is the review on your code. Address the review.",
+        f"## Original task\n\n{task.strip()}",
+    ]
+    if prior:
+        parts.append(
+            "## Previous review/fix rounds (oldest first)\n\n"
+            f"{_format_history(prior)}"
+        )
+    parts.append(f"## Latest review (act on this)\n\n{latest_review.strip()}")
+    return "\n\n".join(parts)

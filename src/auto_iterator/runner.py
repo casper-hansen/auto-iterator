@@ -451,7 +451,12 @@ class ReviewLoopRunner:
                 inner=self.state.inner,
                 model=self.cfg.fix_model,
             )
-            rc, fix_text = await run_fix(self.cfg, self.state.history, tag)
+            rc, fix_text = await run_fix(
+                self.cfg,
+                self.state.history,
+                tag,
+                task=self.state.prompt,
+            )
             print()
             self.log.emit(
                 "fix_finished",

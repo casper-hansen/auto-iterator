@@ -103,8 +103,18 @@ async def run_fix(
     cfg: RunConfig,
     history: list[dict[str, str]],
     tag: str,
+    *,
+    task: str,
 ) -> tuple[int, str]:
     """Run a fix agent and append its output to *history*.
+
+    The fix agent is launched in a fresh CLI session, so the prompt has
+    to carry the full picture: the *task* the implementation is aiming
+    at, the latest reviewer feedback (the last entry in *history*), and
+    the prior rounds so the agent knows what's already been tried.
+    ``task`` is sourced from ``RunState.prompt`` by the runner and
+    threaded through here — same pattern as :func:`run_review` — so any
+    runtime ``ai set-prompt`` edit takes effect on the very next fix.
 
     Returns ``(rc, fix_text)`` so the runner can emit a ``fix_finished``
     event carrying the real exit code instead of guessing."""
@@ -112,7 +122,7 @@ async def run_fix(
 
     rc, fix_text = await run_agent(
         model=cfg.fix_model,
-        prompt=build_fix_prompt(),
+        prompt=build_fix_prompt(task, history),
         tag=tag, **cfg.agent_kw,
     )
     history.append({"role": "fixer", "content": fix_text})
