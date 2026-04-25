@@ -128,6 +128,7 @@ def _make_cfg_from_args(args: argparse.Namespace) -> RunConfig:
         extra_flags=tuple(args.extra_flags or []),
         agent_cmd=args.agent_cmd or os.environ.get("AGENT_CMD", be.default_cmd),
         backend=backend,
+        use_worktree=not getattr(args, "no_worktree", False),
     )
     err = cfg.validate()
     if err:
@@ -175,6 +176,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--foreground", action="store_true",
                        help="Run in the foreground (don't detach). Useful for "
                             "debugging and for legacy review-loop.py parity.")
+    run_p.add_argument("--no-worktree", action="store_true",
+                       help="Disable per-run git worktree isolation. Default is "
+                            "to mount the agent inside <run_dir>/worktree/ on a "
+                            "throwaway branch.")
 
     # ── restart ──
     restart_p = sub.add_parser("restart",
@@ -242,6 +247,44 @@ def _build_parser() -> argparse.ArgumentParser:
     pause_p.add_argument("run_id")
     resume_p = sub.add_parser("resume", help="Let a paused runner continue.")
     resume_p.add_argument("run_id")
+
+    # ── worktree subcommands ──
+    wt_p = sub.add_parser("worktree", help="Print the run's worktree path.")
+    wt_p.add_argument("run_id")
+
+    diff_p = sub.add_parser(
+        "diff",
+        help="Show the worktree's changes vs the source workspace's base commit.",
+    )
+    diff_p.add_argument("run_id")
+    diff_p.add_argument("--full", action="store_true",
+                        help="Emit the full unified diff instead of the per-file summary.")
+    diff_p.add_argument("--stat", action="store_true",
+                        help="Emit ``git diff --stat`` instead of the per-file summary.")
+
+    apply_p = sub.add_parser(
+        "apply",
+        help="Apply the worktree's changes to the source workspace.",
+    )
+    apply_p.add_argument("run_id")
+
+    revert_p = sub.add_parser(
+        "revert",
+        help="Reverse a previous ``ai apply`` in the source workspace.",
+    )
+    revert_p.add_argument("run_id")
+
+    wtrm_p = sub.add_parser(
+        "worktree-remove",
+        help="Delete the run's git worktree and its branch.",
+    )
+    wtrm_p.add_argument("run_id")
+    wtrm_p.add_argument(
+        "--force", action="store_true",
+        help="Remove the worktree even if its changes are still applied "
+             "to the source workspace. The recorded patch is preserved "
+             "so `ai revert` can still undo the apply later.",
+    )
 
     return p
 
@@ -710,6 +753,169 @@ def cmd_resume(args: argparse.Namespace, runs_dir: Path) -> int:
     return EXIT_OK
 
 
+# ── Worktree subcommands ────────────────────────────────────────────────────
+
+def cmd_worktree(args: argparse.Namespace, runs_dir: Path) -> int:
+    run = _resolve_run(runs_dir, args.run_id)
+    from .worktree import load_worktree_info
+
+    info = load_worktree_info(run.paths)
+    if info is None:
+        print(
+            f"error: run '{run.paths.run_id}' has no worktree "
+            "(was it started with --no-worktree, or in a non-git workspace?)",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+    print(info.path)
+    return EXIT_OK
+
+
+def cmd_diff(args: argparse.Namespace, runs_dir: Path) -> int:
+    run = _resolve_run(runs_dir, args.run_id)
+    from .worktree import (
+        is_applied,
+        load_worktree_info,
+        make_diff_stat,
+        make_full_patch,
+        make_status_short,
+    )
+
+    info = load_worktree_info(run.paths)
+    if info is None:
+        print(
+            f"error: run '{run.paths.run_id}' has no worktree.",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+
+    try:
+        if args.full:
+            sys.stdout.write(make_full_patch(info))
+        elif args.stat:
+            sys.stdout.write(make_diff_stat(info))
+        else:
+            # VS Code source-control parity: short status + stat header.
+            short = make_status_short(info)
+            stat = make_diff_stat(info)
+            applied = is_applied(run.paths)
+            print(f"# worktree:        {info.path}")
+            print(f"# source workspace: {info.source_workspace}")
+            print(f"# base commit:     {info.base_commit[:12]} "
+                  f"({info.base_branch or 'detached'})")
+            print(f"# applied to source: {'yes' if applied else 'no'}")
+            print()
+            if not short.strip() and "(no changes)" in stat:
+                print("(no changes)")
+                return EXIT_OK
+            if short.strip():
+                print("Changed files (git status --short):")
+                sys.stdout.write(short)
+                if not short.endswith("\n"):
+                    sys.stdout.write("\n")
+                print()
+            print("Diff stat:")
+            sys.stdout.write(stat)
+        sys.stdout.flush()
+        return EXIT_OK
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_IO_ERROR
+
+
+def cmd_apply(args: argparse.Namespace, runs_dir: Path) -> int:
+    run = _resolve_run(runs_dir, args.run_id)
+    from .worktree import apply_to_source
+
+    ok_, msg = apply_to_source(run.paths)
+    if ok_:
+        print(msg)
+        return EXIT_OK
+    print(f"error: {msg}", file=sys.stderr)
+    return EXIT_IO_ERROR
+
+
+def cmd_revert(args: argparse.Namespace, runs_dir: Path) -> int:
+    run = _resolve_run(runs_dir, args.run_id)
+    from .worktree import revert_from_source
+
+    ok_, msg = revert_from_source(run.paths)
+    if ok_:
+        print(msg)
+        return EXIT_OK
+    print(f"error: {msg}", file=sys.stderr)
+    return EXIT_IO_ERROR
+
+
+def cmd_worktree_remove(args: argparse.Namespace, runs_dir: Path) -> int:
+    run = _resolve_run(runs_dir, args.run_id)
+    from .worktree import (
+        applied_state_path,
+        is_applied,
+        load_worktree_info,
+        remove_worktree,
+        worktree_meta_path,
+    )
+
+    info = load_worktree_info(run.paths)
+    if info is None:
+        print(
+            f"error: run '{run.paths.run_id}' has no worktree.",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+
+    # If the user has an outstanding apply, refuse by default — removing
+    # the worktree at that point doesn't undo the source-workspace edits
+    # but *does* drop ``applied.json`` cleanup paths. Force lets them
+    # opt in anyway (e.g. after manually reverting). Either way, we
+    # always preserve ``applied.json`` so a later ``ai revert`` can use
+    # the recorded patch even though the worktree is gone.
+    if is_applied(run.paths) and not getattr(args, "force", False):
+        print(
+            f"error: run '{run.paths.run_id}' has changes applied to the "
+            "source workspace. Run `ai revert` first, or pass --force to "
+            "remove the worktree anyway (the recorded patch will be "
+            "preserved so `ai revert` keeps working).",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+
+    ok_, msg = remove_worktree(info, force=True)
+    if not ok_:
+        detail = f": {msg}" if msg else ""
+        print(
+            f"error: failed to remove worktree for run '{run.paths.run_id}'{detail}",
+            file=sys.stderr,
+        )
+        print(
+            "worktree metadata preserved so cleanup can be retried.",
+            file=sys.stderr,
+        )
+        return EXIT_IO_ERROR
+
+    # Drop only worktree.json after cleanup succeeds — keep applied.json
+    # so a previously-applied patch can still be reverted.
+    try:
+        worktree_meta_path(run.paths).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(
+            f"error: worktree removed but could not delete metadata: {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_IO_ERROR
+
+    msg_extra = ""
+    if applied_state_path(run.paths).exists():
+        msg_extra = (
+            " (applied.json preserved — `ai revert` still available)"
+        )
+    print(f"worktree removed{msg_extra}")
+    return EXIT_OK
+
+
 # ── Entry ────────────────────────────────────────────────────────────────────
 
 
@@ -725,6 +931,11 @@ _COMMAND_MAP = {
     "set-prompt": cmd_set_prompt,
     "pause": cmd_pause,
     "resume": cmd_resume,
+    "worktree": cmd_worktree,
+    "diff": cmd_diff,
+    "apply": cmd_apply,
+    "revert": cmd_revert,
+    "worktree-remove": cmd_worktree_remove,
 }
 
 

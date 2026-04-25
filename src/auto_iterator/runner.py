@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import dataclasses
 import json
 import os
 import signal
@@ -43,6 +44,14 @@ from .run_dir import (
     append_jsonl,
     atomic_write_json,
     now_iso,
+)
+from .worktree import (
+    WORKTREE_BRANCH_PREFIX,
+    WORKTREE_DIR_NAME,
+    create_worktree,
+    git_toplevel,
+    is_git_repo,
+    save_worktree_info,
 )
 
 
@@ -76,6 +85,8 @@ def spec_to_cfg(spec: dict) -> RunConfig:
         "extra_flags": tuple(spec.get("extra_flags", [])),
         "agent_cmd": spec.get("agent_cmd", "agent"),
         "backend": spec.get("backend", "cursor"),
+        "use_worktree": bool(spec.get("use_worktree", True)),
+        "worktree_path": spec.get("worktree_path"),
     }
     return RunConfig(**kwargs)
 
@@ -115,6 +126,88 @@ def bootstrap_run(
         "agent_type": agent_type,
         "pid": pid,
     })
+
+
+def _provision_worktree(
+    cfg: RunConfig,
+    paths: RunPaths,
+    *,
+    agent_type: str = "review-loop",
+) -> RunConfig:
+    """If ``cfg.use_worktree`` is set, create the worktree and return an
+    updated cfg pointing at it.
+
+    Falls back silently to the original cfg in two cases:
+    * worktree was already provisioned for this run (resumed runner) —
+      detected via the persisted ``worktree.json``;
+    * the workspace isn't a git repo — we warn and continue without a
+      worktree so non-git use cases keep working.
+
+    On success, also re-writes ``spec.json`` with the resolved
+    ``worktree_path`` so external observers see the correct value (the
+    initial bootstrap writes it before provisioning happens).
+    """
+    if not cfg.use_worktree:
+        return cfg
+
+    # Already provisioned (e.g. ``ai restart`` of an existing run-dir).
+    from .worktree import load_worktree_info  # local import — small cycle
+
+    existing = load_worktree_info(paths)
+    if existing is not None and Path(existing.path).exists():
+        agent_cwd = existing.agent_cwd
+        new_cfg = dataclasses.replace(cfg, worktree_path=agent_cwd)
+        # Backfill spec.json if the existing one still has null path.
+        try:
+            atomic_write_json(
+                paths.spec, cfg_to_spec(new_cfg, agent_type=agent_type),
+            )
+        except OSError:
+            pass
+        return new_cfg
+
+    requested = Path(cfg.workspace).resolve()
+    if not is_git_repo(requested):
+        warn(
+            f"Workspace '{requested}' is not a git repository — running "
+            "directly in the source workspace (no worktree isolation). "
+            "Pass --no-worktree to silence this warning."
+        )
+        return cfg
+
+    # Always create the worktree from the git toplevel so apply/revert
+    # cover the whole repo, not just the subdirectory the user pointed
+    # ``ai run`` at. The agent's CWD is rooted at the equivalent subdir
+    # inside the worktree (see ``WorktreeInfo.agent_cwd``).
+    toplevel = git_toplevel(requested) or requested
+
+    target = paths.run_dir / WORKTREE_DIR_NAME
+    branch = f"{WORKTREE_BRANCH_PREFIX}{paths.run_id}"
+    try:
+        info = create_worktree(
+            source_workspace=toplevel,
+            target_path=target,
+            branch_name=branch,
+            requested_workspace=requested,
+        )
+    except RuntimeError as exc:
+        warn(
+            f"Could not create worktree ({exc}); running directly in source "
+            "workspace."
+        )
+        return cfg
+
+    save_worktree_info(paths, info)
+    new_cfg = dataclasses.replace(cfg, worktree_path=info.agent_cwd)
+    # Re-stamp spec.json so it carries the resolved worktree path —
+    # ``bootstrap_run`` already wrote a version with worktree_path=null.
+    try:
+        atomic_write_json(
+            paths.spec, cfg_to_spec(new_cfg, agent_type=agent_type),
+        )
+    except OSError:
+        pass
+    return new_cfg
 
 
 def finalize_run(
@@ -161,13 +254,13 @@ class ReviewLoopRunner:
         *,
         agent_type: str = "review-loop",
     ) -> None:
-        self.cfg = cfg
+        self.cfg = _provision_worktree(cfg, paths, agent_type=agent_type)
         self.paths = paths
         self.agent_type = agent_type
         self.state = RunState(
             run_id=paths.run_id,
-            prompt=cfg.task,
-            workspace=cfg.workspace,
+            prompt=self.cfg.task,
+            workspace=self.cfg.effective_workspace,
         )
         self.log = EventLog(paths, self.state)
         self.heartbeat = Heartbeat(

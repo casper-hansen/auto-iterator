@@ -25,12 +25,26 @@ class RunConfig:
     extra_flags: tuple[str, ...]
     agent_cmd: str = "agent"
     backend: str = "cursor"
+    use_worktree: bool = True
+    # Set by the runner once the worktree is created; agents are launched
+    # with this as their cwd. ``workspace`` keeps pointing at the source
+    # workspace so spec.json is restartable from the user's vantage point.
+    worktree_path: str | None = None
+
+    @property
+    def effective_workspace(self) -> str:
+        """The path agents actually run inside.
+
+        Falls back to ``workspace`` whenever no worktree was created — for
+        ``--no-worktree`` runs, non-git workspaces, or runs that haven't
+        finished bootstrapping yet."""
+        return self.worktree_path or self.workspace
 
     @property
     def agent_kw(self) -> dict:
         """Keyword arguments forwarded to every ``run_agent`` call."""
         return dict(
-            workspace=self.workspace,
+            workspace=self.effective_workspace,
             agent_cmd=self.agent_cmd,
             extra_flags=list(self.extra_flags),
             backend=self.backend,
@@ -46,7 +60,7 @@ class RunConfig:
 
     def banner_items(self) -> dict[str, object]:
         """Ordered dict of label→value pairs for the startup banner."""
-        return {
+        items: dict[str, object] = {
             "task": self.task,
             "impl_model": self.impl_model,
             "fix_model": self.fix_model,
@@ -57,5 +71,9 @@ class RunConfig:
             "skip_impl": self.skip_impl,
             "backend": self.backend,
             "agent_cmd": self.agent_cmd,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "use_worktree": self.use_worktree,
         }
+        if self.worktree_path:
+            items["worktree_path"] = self.worktree_path
+        items["started_at"] = datetime.now(timezone.utc).isoformat()
+        return items

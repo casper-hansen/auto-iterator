@@ -55,6 +55,10 @@ def _build_parser(be) -> argparse.ArgumentParser:
     p.add_argument("--runs-dir", default=None,
                    help="Override the per-user runs dir (default: "
                         "$AUTO_ITERATOR_RUNS_DIR or ~/.auto-iterator/runs).")
+    p.add_argument("--no-worktree", action="store_true",
+                   help="Disable per-run git worktree isolation. Default is "
+                        "to mount the agent inside <run_dir>/worktree/ on a "
+                        "throwaway branch.")
     return p
 
 
@@ -74,6 +78,7 @@ def _parse_config(argv: list[str] | None):
         extra_flags=tuple(args.extra_flags),
         agent_cmd=os.environ.get("AGENT_CMD", be.default_cmd),
         backend=backend,
+        use_worktree=not args.no_worktree,
     )
     return cfg, args.runs_dir
 
