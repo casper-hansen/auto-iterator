@@ -196,9 +196,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Skip SIGTERM and send SIGKILL immediately.")
 
     # ── ls ──
-    ls_p = sub.add_parser("ls", help="List runs; defaults to the current workspace.")
-    ls_p.add_argument("--all", action="store_true",
-                      help="Include runs from other workspaces.")
+    ls_p = sub.add_parser("ls", help="List runs across all workspaces.")
     ls_p.add_argument("--json", action="store_true",
                       help="Emit one JSON object per run on stdout.")
 
@@ -460,8 +458,7 @@ def _signal_runner(run: _ResolvedRun, *, grace: float, force: bool) -> bool:
 
 
 def cmd_ls(args: argparse.Namespace, runs_dir: Path) -> int:
-    workspace = None if args.all else str(Path.cwd().resolve())
-    rows = list_runs(runs_dir, workspace=workspace)
+    rows = list_runs(runs_dir)
     if args.json:
         for row in rows:
             sys.stdout.write(json.dumps(row.as_dict()) + "\n")

@@ -149,20 +149,14 @@ def summarize_run(paths: RunPaths) -> Optional[RunRow]:
     )
 
 
-def list_runs(runs_dir: Path, workspace: Optional[str] = None) -> list[RunRow]:
-    """Scan *runs_dir* and return summaries, newest first.
-
-    If *workspace* is given, restrict to runs whose recorded workspace
-    matches exactly (``ai ls`` defaults to ``$PWD``); otherwise return
-    everything."""
+def list_runs(runs_dir: Path) -> list[RunRow]:
+    """Scan *runs_dir* and return summaries for every run, newest first."""
     from .run_dir import iter_run_dirs
 
     out: list[RunRow] = []
     for paths in iter_run_dirs(runs_dir):
         row = summarize_run(paths)
         if row is None:
-            continue
-        if workspace is not None and row.workspace and row.workspace != workspace:
             continue
         out.append(row)
     out.sort(key=lambda r: r.started_at, reverse=True)
