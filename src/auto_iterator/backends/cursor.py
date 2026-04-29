@@ -20,10 +20,10 @@ class CursorBackend:
     # Cursor's way of pinning max reasoning effort on a model.
     default_impl_model = "claude-opus-4-7-thinking-max"
     default_fix_model = "claude-opus-4-7-thinking-max"
-    default_reviewer_model = "gpt-5.5-xhigh"
+    default_reviewer_model = "gpt-5.5-extra-high"
     default_experimenter_model = "claude-opus-4-7-thinking-max"
     default_adjuster_model = "claude-opus-4-7-thinking-max"
-    default_analyst_model = "gpt-5.5-xhigh"
+    default_analyst_model = "gpt-5.5-extra-high"
 
     def build_initial_cmd(
         self,
