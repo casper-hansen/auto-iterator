@@ -110,12 +110,12 @@ class CodexBackend:
     # Cursor's ``-xhigh`` suffix and Claude Code's ``--effort max`` do.
     # Overridable per-call via ``extra_flags`` / ``--impl-model`` /
     # ``--reviewer`` on the CLI frontends (later flags win).
-    default_impl_model = "gpt-5.4"
-    default_fix_model = "gpt-5.4"
-    default_reviewer_model = "gpt-5.4"
-    default_experimenter_model = "gpt-5.4"
-    default_adjuster_model = "gpt-5.4"
-    default_analyst_model = "gpt-5.4"
+    default_impl_model = "gpt-5.5"
+    default_fix_model = "gpt-5.5"
+    default_reviewer_model = "gpt-5.5"
+    default_experimenter_model = "gpt-5.5"
+    default_adjuster_model = "gpt-5.5"
+    default_analyst_model = "gpt-5.5"
 
     # ``--skip-git-repo-check`` lets Codex run in workspaces that aren't git
     # repositories (matches the looser contract of the other backends).
