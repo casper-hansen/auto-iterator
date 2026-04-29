@@ -184,16 +184,22 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── restart ──
     restart_p = sub.add_parser("restart",
                                help="Kill a run and respawn from its spec.json.")
-    restart_p.add_argument("run_id")
+    restart_p.add_argument("run_id", nargs="?")
     restart_p.add_argument("--grace", type=float, default=5.0,
                            help="Seconds to wait after SIGTERM before SIGKILL.")
+    restart_p.add_argument("--yes", "-y", action="store_true",
+                           help="Skip the confirmation prompt that follows "
+                                "the interactive selector.")
 
     # ── kill ──
     kill_p = sub.add_parser("kill", help="Signal a running runner and wait.")
-    kill_p.add_argument("run_id")
+    kill_p.add_argument("run_id", nargs="?")
     kill_p.add_argument("--grace", type=float, default=5.0)
     kill_p.add_argument("--force", action="store_true",
                         help="Skip SIGTERM and send SIGKILL immediately.")
+    kill_p.add_argument("--yes", "-y", action="store_true",
+                        help="Skip the confirmation prompt that follows "
+                             "the interactive selector.")
 
     # ── ls ──
     ls_p = sub.add_parser("ls", help="List runs across all workspaces.")
@@ -201,32 +207,57 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Emit one JSON object per run on stdout.")
 
     # ── show ──
-    show_p = sub.add_parser("show", help="Print a run's state.json snapshot.")
-    show_p.add_argument("run_id")
-    show_p.add_argument("--json", action="store_true")
+    show_p = sub.add_parser("show",
+                            help="Render a human-readable status view for a run.")
+    show_p.add_argument("run_id", nargs="?")
+    show_p.add_argument("--json", action="store_true",
+                        help="Emit raw state.json instead of the rendered view.")
+    show_p.add_argument("--logs", action="store_true",
+                        help="Tail logs/agent.log instead of the status view.")
+    show_p.add_argument("--lines", type=int, default=50,
+                        help="With --logs, how many tail lines to print "
+                             "(default 50).")
 
     # ── tail ──
-    tail_p = sub.add_parser("tail", help="Stream events.jsonl (optionally follow).")
-    tail_p.add_argument("run_id")
-    tail_p.add_argument("--lines", type=int, default=200,
-                        help="Emit the last N events before following (default 200).")
+    tail_p = sub.add_parser("tail",
+                            help="Stream a run's events in a readable format.")
+    tail_p.add_argument("run_id", nargs="?")
+    tail_p.add_argument("--lines", type=int, default=50,
+                        help="Emit the last N events before following (default 50).")
     tail_p.add_argument("--follow", action="store_true")
     tail_p.add_argument("--from-seq", type=int, default=None,
                         help="Start from events with seq > K (ignores --lines).")
     tail_p.add_argument("--type", action="append", default=[], dest="types",
                         help="Filter to these event types (repeatable).")
+    tail_p.add_argument("--raw", "--json", action="store_true", dest="raw",
+                        help="Emit raw events.jsonl lines instead of the "
+                             "rendered view (for scripting / jq).")
+    tail_p.add_argument("--agent-log", action="store_true",
+                        help="Tail logs/agent.log (raw subprocess transcript) "
+                             "instead of structured events. Defaults to 50 "
+                             "lines unless --lines is passed.")
 
     # ── send ──
+    # Both positionals are ``nargs="?"`` so argparse can parse the four
+    # supported forms uniformly:
+    #   ai send TEXT
+    #   ai send RUN_ID TEXT
+    #   ai send --wait TEXT
+    #   ai send RUN_ID --wait TEXT
+    # The single-positional case (``run_id`` set, ``text`` is None) is
+    # disambiguated post-parse by :func:`_normalize_send_args` — argparse
+    # has no way to express "the lone positional is *text*, not run_id"
+    # while still accepting "RUN_ID TEXT" with optional flags interleaved.
     send_p = sub.add_parser("send", help="Queue operator guidance for the next review.")
-    send_p.add_argument("run_id")
-    send_p.add_argument("text")
+    send_p.add_argument("run_id", nargs="?")
+    send_p.add_argument("text", nargs="?")
     send_p.add_argument("--wait", action="store_true",
                         help="Block until the runner records guidance_received.")
 
     # ── rewind ──
     rewind_p = sub.add_parser("rewind",
                               help="Jump back to (outer, inner, phase).")
-    rewind_p.add_argument("run_id")
+    rewind_p.add_argument("run_id", nargs="?")
     rewind_p.add_argument("--to", required=True,
                           help="outer=N,inner=M[,phase=review|fix|after_impl]")
     rewind_p.add_argument("--wait", action="store_true")
@@ -234,7 +265,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── set-prompt ──
     sp_p = sub.add_parser("set-prompt",
                           help="Replace the review-loop's task prompt.")
-    sp_p.add_argument("run_id")
+    sp_p.add_argument("run_id", nargs="?")
     sp_g = sp_p.add_mutually_exclusive_group(required=True)
     sp_g.add_argument("--text")
     sp_g.add_argument("--prompt-file", dest="file")
@@ -242,19 +273,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── pause / resume ──
     pause_p = sub.add_parser("pause", help="Stall the runner at the next boundary.")
-    pause_p.add_argument("run_id")
+    pause_p.add_argument("run_id", nargs="?")
     resume_p = sub.add_parser("resume", help="Let a paused runner continue.")
-    resume_p.add_argument("run_id")
+    resume_p.add_argument("run_id", nargs="?")
 
     # ── worktree subcommands ──
     wt_p = sub.add_parser("worktree", help="Print the run's worktree path.")
-    wt_p.add_argument("run_id")
+    wt_p.add_argument("run_id", nargs="?")
 
     diff_p = sub.add_parser(
         "diff",
         help="Show the worktree's changes vs the source workspace's base commit.",
     )
-    diff_p.add_argument("run_id")
+    diff_p.add_argument("run_id", nargs="?")
     diff_p.add_argument("--full", action="store_true",
                         help="Emit the full unified diff instead of the per-file summary.")
     diff_p.add_argument("--stat", action="store_true",
@@ -264,25 +295,34 @@ def _build_parser() -> argparse.ArgumentParser:
         "apply",
         help="Apply the worktree's changes to the source workspace.",
     )
-    apply_p.add_argument("run_id")
+    apply_p.add_argument("run_id", nargs="?")
+    apply_p.add_argument("--yes", "-y", action="store_true",
+                         help="Skip the confirmation prompt that follows "
+                              "the interactive selector.")
 
     revert_p = sub.add_parser(
         "revert",
         help="Reverse a previous ``ai apply`` in the source workspace.",
     )
-    revert_p.add_argument("run_id")
+    revert_p.add_argument("run_id", nargs="?")
+    revert_p.add_argument("--yes", "-y", action="store_true",
+                          help="Skip the confirmation prompt that follows "
+                               "the interactive selector.")
 
     wtrm_p = sub.add_parser(
         "worktree-remove",
         help="Delete the run's git worktree and its branch.",
     )
-    wtrm_p.add_argument("run_id")
+    wtrm_p.add_argument("run_id", nargs="?")
     wtrm_p.add_argument(
         "--force", action="store_true",
         help="Remove the worktree even if its changes are still applied "
              "to the source workspace. The recorded patch is preserved "
              "so `ai revert` can still undo the apply later.",
     )
+    wtrm_p.add_argument("--yes", "-y", action="store_true",
+                        help="Skip the confirmation prompt that follows "
+                             "the interactive selector.")
 
     return p
 
@@ -504,29 +544,46 @@ def _print_ls_table(rows: list) -> None:
 
 def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
     run = _resolve_run(runs_dir, args.run_id)
-    try:
-        state_text = run.paths.state.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        # State not yet written — fall back to meta for something useful.
-        state_text = json.dumps(run.meta, indent=2)
-    # ``ai show`` always prints a JSON object; ``--json`` is accepted for
-    # parity with ``ls`` but doesn't change the payload.
+    from .display import (
+        render_agent_log_tail,
+        render_status_view,
+        state_json_text,
+    )
+
+    # ``--logs`` is the explicit drop-into-raw-transcript escape hatch
+    # mentioned in the rendered view's footer. It takes precedence over
+    # ``--json`` because the user has typed two flags worth of intent.
+    if getattr(args, "logs", False):
+        sys.stdout.write(
+            render_agent_log_tail(run.paths, lines=max(1, getattr(args, "lines", 50)))
+        )
+        return EXIT_OK
+
     if args.json:
-        try:
-            obj = json.loads(state_text)
-        except json.JSONDecodeError:
-            obj = {"raw": state_text}
-        print(json.dumps(obj, indent=2))
-    else:
-        sys.stdout.write(state_text)
-        if not state_text.endswith("\n"):
-            sys.stdout.write("\n")
+        sys.stdout.write(state_json_text(run.paths))
+        return EXIT_OK
+
+    sys.stdout.write(render_status_view(run.paths))
     return EXIT_OK
 
 
 def cmd_tail(args: argparse.Namespace, runs_dir: Path) -> int:
     run = _resolve_run(runs_dir, args.run_id)
+
+    # ``--agent-log`` is a separate code path: raw transcript, no
+    # follow, no event filtering. It's the explicit way to drop below
+    # the structured event view when something weird is happening in
+    # the agent process itself.
+    if getattr(args, "agent_log", False):
+        from .display import render_agent_log_tail
+
+        sys.stdout.write(
+            render_agent_log_tail(run.paths, lines=max(1, args.lines))
+        )
+        return EXIT_OK
+
     types = set(args.types) if args.types else None
+    use_raw = getattr(args, "raw", False)
 
     def _process(evt: dict) -> bool:
         """Emit the event (respecting ``--type``); return True iff terminal.
@@ -536,7 +593,7 @@ def cmd_tail(args: argparse.Namespace, runs_dir: Path) -> int:
         than spinning forever on a finished run."""
         terminal = evt.get("type") in TERMINAL_EVENT_TYPES
         if not types or evt.get("type") in types:
-            _emit_event(evt)
+            _emit_event(evt, raw=use_raw)
         return terminal
 
     last_seq = 0
@@ -553,6 +610,8 @@ def cmd_tail(args: argparse.Namespace, runs_dir: Path) -> int:
         last_seq = int(initial[-1]["seq"]) if initial and "seq" in initial[-1] else 0
 
     if not args.follow or saw_terminal:
+        if not use_raw and not args.follow:
+            _print_tail_footer(run.paths.run_id)
         return EXIT_OK
 
     # Polling follow: simple, lockless, never contends with the writer.
@@ -571,9 +630,27 @@ def cmd_tail(args: argparse.Namespace, runs_dir: Path) -> int:
         return EXIT_OK
 
 
-def _emit_event(evt: dict) -> None:
-    """One JSON object per line — friendly to ``jq`` and shell loops."""
-    sys.stdout.write(json.dumps(evt) + "\n")
+def _emit_event(evt: dict, *, raw: bool = False) -> None:
+    """Emit one event line — JSON for ``--raw``, rendered otherwise."""
+    if raw:
+        sys.stdout.write(json.dumps(evt) + "\n")
+    else:
+        from .display import render_event
+
+        sys.stdout.write(render_event(evt) + "\n")
+    sys.stdout.flush()
+
+
+def _print_tail_footer(run_id: str) -> None:
+    """Hint operators at the agent-log escape hatch when emitting rendered output."""
+    if not sys.stdout.isatty():
+        return
+    from .colors import DIM, NC
+
+    sys.stdout.write(
+        f"{DIM}tip: ai tail {run_id} --agent-log to see the raw "
+        f"agent transcript · --raw for JSON{NC}\n"
+    )
     sys.stdout.flush()
 
 
@@ -936,11 +1013,149 @@ _COMMAND_MAP = {
 }
 
 
+# Subcommands that target a single run and therefore support the
+# interactive selector when ``run_id`` is omitted. ``run`` and ``ls``
+# are intentionally excluded — they don't take a ``run_id`` argument at
+# all.
+SELECTOR_COMMANDS = frozenset({
+    "restart", "kill", "show", "tail", "send", "rewind", "set-prompt",
+    "pause", "resume", "worktree", "diff", "apply", "revert",
+    "worktree-remove",
+})
+
+# Subset of selector commands whose effect is destructive enough that
+# we prompt for confirmation when the run id was picked from the
+# selector. Explicit ``run_id`` arguments — and a ``--yes`` flag —
+# bypass this. The intent is "stop a tired operator from killing the
+# wrong run because they pressed Enter on the wrong row".
+DESTRUCTIVE_COMMANDS = frozenset({
+    "kill", "restart", "apply", "revert", "worktree-remove",
+})
+
+
+def _normalize_send_args(args: argparse.Namespace) -> Optional[int]:
+    """Disambiguate ``ai send``'s two optional positionals.
+
+    ``run_id`` and ``text`` are both registered ``nargs="?"`` so that
+    optional flags can appear between them (e.g. ``ai send RID --wait
+    TEXT``). When the user passes only one positional, argparse fills
+    ``run_id`` with it and leaves ``text=None``; we want the opposite —
+    the single positional is the *guidance text* and ``run_id`` should
+    be left empty so the selector can fill it in.
+
+    Returns an exit code if the args are unrecoverable, ``None`` if
+    normalization succeeded and dispatch should continue."""
+    if getattr(args, "cmd", None) != "send":
+        return None
+    run_id = getattr(args, "run_id", None)
+    text = getattr(args, "text", None)
+    if text is None and run_id is not None:
+        # Single positional: treat it as the guidance text.
+        args.text = run_id
+        args.run_id = None
+        return None
+    if text is None and run_id is None:
+        print(
+            "error: `ai send` requires guidance text "
+            "(usage: ai send [RUN_ID] TEXT [--wait])",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+    return None
+
+
+def _resolve_selector_run_id(
+    args: argparse.Namespace, runs_dir: Path
+) -> int:
+    """If a selector-enabled command omits ``run_id``, fill it in.
+
+    Return value is an exit code: ``EXIT_OK`` means "args.run_id is now
+    populated, dispatch normally"; anything else means we already
+    printed an error message and the CLI should return that code.
+
+    Sets ``args._selected = True`` iff the id was chosen via the
+    interactive selector. That flag drives the destructive-action
+    confirmation in :func:`_maybe_confirm`."""
+    args._selected = False
+    if args.cmd not in SELECTOR_COMMANDS:
+        return EXIT_OK
+    if getattr(args, "run_id", None):
+        return EXIT_OK
+
+    from .selector import is_interactive, select_run
+
+    if not is_interactive():
+        print(
+            f"error: '{args.cmd}' requires a run_id when stdin/stdout "
+            "is not a TTY. Pass it explicitly (see `ai ls`) or run "
+            "interactively to use the selector.",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+
+    rows = list_runs(runs_dir)
+    if not rows:
+        print("(no runs)", file=sys.stderr)
+        return EXIT_USER_ERROR
+
+    chosen = select_run(rows, prompt=f"Select run for `ai {args.cmd}`")
+    if chosen is None:
+        print("cancelled", file=sys.stderr)
+        return EXIT_USER_ERROR
+    args.run_id = chosen.run_id
+    args._selected = True
+    return EXIT_OK
+
+
+def _maybe_confirm(args: argparse.Namespace) -> bool:
+    """Prompt before running a destructive command picked from the selector.
+
+    Skipped when:
+
+    * the command isn't destructive,
+    * the run id was passed explicitly (operator already named the
+      target),
+    * the operator passed ``--yes`` / ``-y``,
+    * stdin isn't a TTY (scripted callers must not block on input).
+
+    Returns ``True`` iff the command should proceed."""
+    if args.cmd not in DESTRUCTIVE_COMMANDS:
+        return True
+    if not getattr(args, "_selected", False):
+        return True
+    if getattr(args, "yes", False):
+        return True
+    try:
+        if not sys.stdin.isatty():
+            return True
+    except (AttributeError, OSError):
+        return True
+    try:
+        ans = input(
+            f"Confirm `ai {args.cmd} {args.run_id}`? [y/N] "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("cancelled", file=sys.stderr)
+        return False
+    if ans in ("y", "yes"):
+        return True
+    print("cancelled", file=sys.stderr)
+    return False
+
+
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     runs_dir = resolve_runs_dir(args.runs_dir)
     try:
+        rc = _normalize_send_args(args)
+        if rc is not None:
+            return rc
+        rc = _resolve_selector_run_id(args, runs_dir)
+        if rc != EXIT_OK:
+            return rc
+        if not _maybe_confirm(args):
+            return EXIT_USER_ERROR
         return _COMMAND_MAP[args.cmd](args, runs_dir)
     except KeyboardInterrupt:
         return EXIT_OK
