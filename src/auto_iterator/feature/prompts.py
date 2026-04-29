@@ -54,7 +54,7 @@ def build_review_prompt(
     guidance: list[str] | None = None,
 ) -> str:
     preamble = (
-        "Inspect the git diff on our branch to main branch. "
+        "Inspect the git diff in our worktree relative to the main branch. "
         "Review if we have made an excellent implementation of the following:\n\n"
         f"{task}"
     )

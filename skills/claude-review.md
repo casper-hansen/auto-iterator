@@ -1,6 +1,6 @@
 # Local branch code review
 
-Provide a rigorous review of the current branch's changes relative to
+Provide a rigorous review of the current worktree's changes relative to
 `main`, including any uncommitted work. There is no GitHub PR — review
 the local diff directly.
 
