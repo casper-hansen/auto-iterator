@@ -8,8 +8,18 @@ the protocol.
 Subcommand families
 -------------------
 * Spawn / lifecycle — ``run``, ``restart``, ``kill``.
-* Read — ``ls``, ``show``, ``tail``.
+* Read — ``ls``, ``show`` (the primary observation command).
 * Mutate — ``send``, ``rewind``, ``set-prompt``, ``pause``, ``resume``.
+
+``ai show`` is the single user-facing observation experience: in a TTY
+it draws a continuously-refreshing combined view (status + recent
+structured events + tail of the agent transcript) and exits cleanly
+on Ctrl-C; outside a TTY it produces a one-shot text version of the
+same combined view. ``ai tail`` is preserved only as a deprecated
+alias whose default path delegates to ``ai show`` (so plain
+``ai tail RID`` is the same live view as ``ai show RID``); its
+``--raw`` / ``--from-seq`` / ``--type`` flags remain as a raw-JSONL
+escape hatch for jq-style scripting against ``events.jsonl``.
 
 Exit codes follow the spec:
 ``0`` success / ``1`` user error / ``2`` IO or permission error /
@@ -207,35 +217,75 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Emit one JSON object per run on stdout.")
 
     # ── show ──
-    show_p = sub.add_parser("show",
-                            help="Render a human-readable status view for a run.")
+    # ``ai show`` is the primary observation command. In a TTY it
+    # draws a live combined view (status + events + agent output);
+    # outside a TTY (or with ``--once``) it prints the same view once
+    # and exits. ``--json`` keeps emitting raw ``state.json`` so scripts
+    # don't need to learn the new renderer.
+    show_p = sub.add_parser(
+        "show",
+        help="Live combined view of a run (status + events + agent output).",
+    )
     show_p.add_argument("run_id", nargs="?")
     show_p.add_argument("--json", action="store_true",
-                        help="Emit raw state.json instead of the rendered view.")
+                        help="Emit raw state.json (one-shot, scriptable). "
+                             "Bypasses the combined renderer.")
+    show_p.add_argument("--once", action="store_true",
+                        help="Print the combined view once and exit "
+                             "(no live refresh). Implied when stdout is "
+                             "not a TTY.")
+    show_p.add_argument("--event-lines", type=int, default=12,
+                        help="Recent events to show in the combined view "
+                             "(default 12).")
+    show_p.add_argument("--log-lines", type=int, default=30,
+                        help="Agent-output tail lines to show in the "
+                             "combined view (default 30).")
+    show_p.add_argument("--lines", type=int, default=None,
+                        help="Backwards-compat alias: sets --log-lines.")
+    show_p.add_argument("--refresh", type=float, default=0.4,
+                        help="Live refresh interval in seconds "
+                             "(default 0.4, min 0.05).")
+    # ``--logs`` predates the combined view; it used to drop into a raw
+    # ``agent.log`` tail. It is now an internal alias for ``--once`` so
+    # any scripts that still invoke it keep producing readable output.
     show_p.add_argument("--logs", action="store_true",
-                        help="Tail logs/agent.log instead of the status view.")
-    show_p.add_argument("--lines", type=int, default=50,
-                        help="With --logs, how many tail lines to print "
-                             "(default 50).")
+                        help=argparse.SUPPRESS)
 
-    # ── tail ──
-    tail_p = sub.add_parser("tail",
-                            help="Stream a run's events in a readable format.")
+    # ── tail (deprecated alias for show) ──
+    # ``ai tail`` is no longer a separate observation experience. It
+    # delegates to ``ai show`` for the rendered/live path; the raw
+    # event-stream flags remain for jq-style scripting because there is
+    # no other place to read raw ``events.jsonl`` lines through the CLI.
+    tail_p = sub.add_parser(
+        "tail",
+        help="DEPRECATED: alias for `ai show`. Use `ai show RUN_ID`.",
+        description=(
+            "Deprecated alias for `ai show`. The default rendered output "
+            "is now the combined live view. The --raw / --from-seq / --type "
+            "flags remain available for scripts that need to read "
+            "events.jsonl directly."
+        ),
+    )
     tail_p.add_argument("run_id", nargs="?")
     tail_p.add_argument("--lines", type=int, default=50,
-                        help="Emit the last N events before following (default 50).")
-    tail_p.add_argument("--follow", action="store_true")
+                        help="Last N events to emit (default 50). "
+                             "Used by the rendered path and by --raw "
+                             "scripting output.")
+    tail_p.add_argument("--follow", action="store_true",
+                        help="Deprecated no-op; `ai show` (and the "
+                             "default `ai tail` redirect) are already "
+                             "live in a TTY.")
     tail_p.add_argument("--from-seq", type=int, default=None,
-                        help="Start from events with seq > K (ignores --lines).")
+                        help="Scripting: start from events with seq > K. "
+                             "Always emits raw JSONL (no rendered view).")
     tail_p.add_argument("--type", action="append", default=[], dest="types",
-                        help="Filter to these event types (repeatable).")
+                        help="Scripting filter (repeatable). Always "
+                             "emits raw JSONL (no rendered view).")
     tail_p.add_argument("--raw", "--json", action="store_true", dest="raw",
-                        help="Emit raw events.jsonl lines instead of the "
-                             "rendered view (for scripting / jq).")
+                        help="Scripting: emit raw events.jsonl lines.")
     tail_p.add_argument("--agent-log", action="store_true",
-                        help="Tail logs/agent.log (raw subprocess transcript) "
-                             "instead of structured events. Defaults to 50 "
-                             "lines unless --lines is passed.")
+                        help="Deprecated; `ai show` already includes the "
+                             "agent transcript.")
 
     # ── send ──
     # Both positionals are ``nargs="?"`` so argparse can parse the four
@@ -542,48 +592,162 @@ def _print_ls_table(rows: list) -> None:
         print(line)
 
 
+def _stdout_is_tty() -> bool:
+    """Single check used by show/tail dispatchers; tolerates patched sys.stdout."""
+    try:
+        return bool(sys.stdout.isatty())
+    except (AttributeError, OSError):
+        return False
+
+
 def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
+    """Render a run.
+
+    Default flow:
+
+    * ``--json`` → one-shot raw ``state.json`` (scriptable).
+    * Non-TTY stdout, or ``--once`` / ``--logs`` → one-shot combined view.
+    * Interactive TTY → live combined view, refreshed on a timer until
+      Ctrl-C.
+    """
     run = _resolve_run(runs_dir, args.run_id)
     from .display import (
-        render_agent_log_tail,
-        render_status_view,
+        render_combined_view,
+        run_live_show,
         state_json_text,
     )
-
-    # ``--logs`` is the explicit drop-into-raw-transcript escape hatch
-    # mentioned in the rendered view's footer. It takes precedence over
-    # ``--json`` because the user has typed two flags worth of intent.
-    if getattr(args, "logs", False):
-        sys.stdout.write(
-            render_agent_log_tail(run.paths, lines=max(1, getattr(args, "lines", 50)))
-        )
-        return EXIT_OK
 
     if args.json:
         sys.stdout.write(state_json_text(run.paths))
         return EXIT_OK
 
-    sys.stdout.write(render_status_view(run.paths))
-    return EXIT_OK
+    event_lines = max(1, int(getattr(args, "event_lines", 12) or 12))
+    log_lines_default = int(getattr(args, "log_lines", 30) or 30)
+    log_lines = max(1, log_lines_default)
+    if getattr(args, "lines", None) is not None:
+        # Backwards-compat alias: ``--lines`` continues to control the
+        # agent-output tail size (matching the deprecated
+        # ``--logs``/``--lines`` pairing).
+        log_lines = max(1, int(args.lines))
+
+    once = bool(getattr(args, "once", False) or getattr(args, "logs", False))
+    if once or not _stdout_is_tty():
+        sys.stdout.write(render_combined_view(
+            run.paths,
+            event_lines=event_lines,
+            log_lines=log_lines,
+        ))
+        return EXIT_OK
+
+    refresh = max(0.05, float(getattr(args, "refresh", 0.4) or 0.4))
+    return run_live_show(
+        run.paths,
+        event_lines=event_lines,
+        log_lines=log_lines,
+        refresh_seconds=refresh,
+    )
+
+
+def _show_args_from_tail(args: argparse.Namespace) -> argparse.Namespace:
+    """Translate ``ai tail`` args into the equivalent ``ai show`` args.
+
+    The rendered tail path is folded entirely into :func:`cmd_show`,
+    so ``ai tail RUN_ID`` is a true alias for ``ai show RUN_ID``: live
+    combined view in a TTY, one-shot rendered text otherwise. This
+    helper only exists to translate ``ai tail``'s legacy ``--lines`` /
+    ``--agent-log`` / ``--follow`` knobs into ``ai show``'s vocabulary.
+
+    Translation rules:
+
+    * ``ai tail --lines N`` (old: last N events) → ``event_lines=N``
+      so the rendered events section grows accordingly.
+    * ``ai tail --agent-log --lines N`` (old: last N agent log lines)
+      → ``log_lines=N`` so the agent-output section honours the
+      explicit cap.
+    * ``ai tail --follow`` is a deprecated no-op: ``cmd_show`` already
+      enters the live combined-view loop in a TTY by default.
+
+    ``once`` is left ``False`` here so :func:`cmd_show` decides between
+    live and one-shot purely based on whether stdout is a TTY — the
+    same rule it uses for ``ai show RUN_ID``. That parity is the whole
+    point of the deprecation: there is no longer a separate "tail UX"
+    that diverges from ``show``.
+
+    The tail-only scripting flags (``--raw``, ``--from-seq``,
+    ``--type``) are handled directly in :func:`cmd_tail` and never
+    reach this helper."""
+    is_agent_log = bool(getattr(args, "agent_log", False))
+    requested = max(1, int(args.lines or 50))
+    return argparse.Namespace(
+        cmd="show",
+        run_id=args.run_id,
+        json=False,
+        # ``ai tail`` is now a thin alias for ``ai show``. We never
+        # force the one-shot path here: ``cmd_show`` picks live vs.
+        # one-shot from the TTY check, and ``--follow`` is therefore
+        # redundant. Both ``ai tail RID`` and ``ai tail --follow RID``
+        # land on the same live loop in a TTY.
+        once=False,
+        event_lines=12 if is_agent_log else min(200, requested),
+        log_lines=requested if is_agent_log else 30,
+        lines=None,
+        refresh=0.4,
+        logs=False,
+    )
 
 
 def cmd_tail(args: argparse.Namespace, runs_dir: Path) -> int:
+    """Compatibility shim for the (now deprecated) ``ai tail``.
+
+    Behavior contract:
+
+    * Default rendered output → delegates to :func:`cmd_show` so
+      operators see the same combined view they'd get from
+      ``ai show``. Prints a one-line deprecation note to stderr in TTY.
+    * ``--agent-log`` → also delegates to ``cmd_show`` (the combined
+      view already embeds the agent transcript). Notes deprecation.
+    * Scripting flags (``--raw`` / ``--from-seq`` / ``--type``) →
+      raw ``events.jsonl`` JSONL output. These flags are explicitly
+      scripting-only: they always emit JSONL, even when ``--raw``
+      isn't passed, so there is no second rendered events renderer
+      lurking on the ``ai tail`` side.
+    """
+    use_raw = bool(getattr(args, "raw", False))
+    has_seq = getattr(args, "from_seq", None) is not None
+    has_types = bool(getattr(args, "types", []))
+    is_scripting = use_raw or has_seq or has_types
+
+    if not is_scripting:
+        # Rendered/agent-log paths fold into ``ai show``. We resolve
+        # the run here only to keep the "run not found" error path
+        # firing before the deprecation hint, so an operator who typed
+        # the wrong id sees a useful error instead of redirected noise.
+        _resolve_run(runs_dir, args.run_id)
+        if sys.stderr.isatty():
+            target = "ai show"
+            if getattr(args, "agent_log", False):
+                hint = (
+                    f"note: `ai tail --agent-log` is folded into `ai show` — "
+                    f"`{target} {args.run_id}` already includes the agent "
+                    "transcript."
+                )
+            else:
+                hint = (
+                    f"note: `ai tail` is deprecated. Run "
+                    f"`{target} {args.run_id}` for the combined live view."
+                )
+            print(hint, file=sys.stderr)
+        return cmd_show(_show_args_from_tail(args), runs_dir)
+
+    # Scripting path: raw events JSONL output, no rendered view.
+    # Any of ``--raw`` / ``--from-seq`` / ``--type`` opts in. We force
+    # ``raw=True`` for the emit even when only ``--from-seq`` /
+    # ``--type`` were passed — these flags exist for jq-style
+    # pipelines and a rendered events stream is precisely the second
+    # renderer the spec told us to retire. Operators who want the
+    # rendered combined view should run ``ai show``.
     run = _resolve_run(runs_dir, args.run_id)
-
-    # ``--agent-log`` is a separate code path: raw transcript, no
-    # follow, no event filtering. It's the explicit way to drop below
-    # the structured event view when something weird is happening in
-    # the agent process itself.
-    if getattr(args, "agent_log", False):
-        from .display import render_agent_log_tail
-
-        sys.stdout.write(
-            render_agent_log_tail(run.paths, lines=max(1, args.lines))
-        )
-        return EXIT_OK
-
     types = set(args.types) if args.types else None
-    use_raw = getattr(args, "raw", False)
 
     def _process(evt: dict) -> bool:
         """Emit the event (respecting ``--type``); return True iff terminal.
@@ -593,7 +757,7 @@ def cmd_tail(args: argparse.Namespace, runs_dir: Path) -> int:
         than spinning forever on a finished run."""
         terminal = evt.get("type") in TERMINAL_EVENT_TYPES
         if not types or evt.get("type") in types:
-            _emit_event(evt, raw=use_raw)
+            _emit_event(evt, raw=True)
         return terminal
 
     last_seq = 0
@@ -610,8 +774,6 @@ def cmd_tail(args: argparse.Namespace, runs_dir: Path) -> int:
         last_seq = int(initial[-1]["seq"]) if initial and "seq" in initial[-1] else 0
 
     if not args.follow or saw_terminal:
-        if not use_raw and not args.follow:
-            _print_tail_footer(run.paths.run_id)
         return EXIT_OK
 
     # Polling follow: simple, lockless, never contends with the writer.
@@ -638,19 +800,6 @@ def _emit_event(evt: dict, *, raw: bool = False) -> None:
         from .display import render_event
 
         sys.stdout.write(render_event(evt) + "\n")
-    sys.stdout.flush()
-
-
-def _print_tail_footer(run_id: str) -> None:
-    """Hint operators at the agent-log escape hatch when emitting rendered output."""
-    if not sys.stdout.isatty():
-        return
-    from .colors import DIM, NC
-
-    sys.stdout.write(
-        f"{DIM}tip: ai tail {run_id} --agent-log to see the raw "
-        f"agent transcript · --raw for JSON{NC}\n"
-    )
     sys.stdout.flush()
 
 

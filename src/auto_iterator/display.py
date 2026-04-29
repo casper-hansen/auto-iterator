@@ -1,18 +1,24 @@
-"""Human-readable rendering for ``ai show`` and ``ai tail``.
+"""Human-readable rendering for ``ai show``.
 
 This module owns the *presentation* layer for the operator CLI. The
 underlying data — ``meta.json``, ``state.json``, ``events.jsonl``,
 ``logs/agent.log`` — is read by the existing modules; we just shape it
 into something pleasant to look at in a terminal.
 
-Two responsibilities live here:
+The single user-facing observation command is :func:`render_combined_view`,
+which folds three sections into one screen:
 
-* :func:`render_status_view` — a labelled key/value block built from the
-  reconciled status, ``meta.json`` and ``state.json``. This is what the
-  default ``ai show RUN_ID`` prints.
-* :func:`render_event` — a one-line summary of a single event, used by
-  the default ``ai tail RUN_ID``. JSON / raw output (for scripting) is
-  still available via ``ai tail --raw``.
+1. Status — labelled key/value block built from the reconciled status,
+   ``meta.json`` and ``state.json``. Stable across refreshes so the eye
+   has a quiet anchor.
+2. Recent events — the most recent structured events rendered through
+   :func:`render_event`.
+3. Agent output — the tail of ``logs/agent.log`` so operators don't
+   need to know about, ``cat``, or ``tail -f`` that file directly.
+
+In an interactive terminal, :func:`run_live_show` repaints this view on
+a polling timer. Outside a TTY, callers print the same text once and
+exit; ``--json`` keeps emitting raw ``state.json`` for scripts.
 
 ANSI styling is deferred to :mod:`auto_iterator.colors` so ``NO_COLOR``
 and non-TTY callers automatically get plain text.
@@ -21,15 +27,91 @@ and non-TTY callers automatically get plain text.
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional, Tuple
 
 from .colors import BOLD, DIM, GREEN, RED, YELLOW, CYAN, NC
+from .events import tail_events
 from .ls import reconcile_status
 from .meta import read_meta
 from .run_dir import RunPaths, read_json
 
 
-# ── ``ai show`` — labelled status view ────────────────────────────────────────
+# ANSI escape stripping for visible-width measurements. The status
+# section pads colored values into aligned columns, and ``str.ljust``
+# can't tell that ``"\x1b[32mok\x1b[0m"`` is 2 visible characters wide.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _visible_len(s: str) -> int:
+    return len(_ANSI_RE.sub("", s))
+
+
+def _vpad(s: str, width: int) -> str:
+    """Right-pad *s* with spaces to *width* visible characters."""
+    delta = width - _visible_len(s)
+    if delta <= 0:
+        return s
+    return s + " " * delta
+
+
+def _truncate_visible(s: str, max_cols: int) -> str:
+    """Truncate *s* to ``max_cols`` visible columns, keeping ANSI intact.
+
+    The live renderer measures terminal *rows* via :func:`fit_section_caps`,
+    but rows alone aren't enough: a line wider than the terminal's
+    columns wraps to a second physical row, silently doubling the
+    section's height. That's the regression this helper exists for —
+    truncating each output line to the column budget guarantees the
+    rendered line consumes exactly one terminal row, so the row-based
+    fit logic stays accurate even with long workspace paths or long
+    agent transcript lines.
+
+    Properties:
+
+    * Visible width is measured with :data:`_ANSI_RE` stripped, so
+      ``"\\x1b[32mok\\x1b[0m"`` counts as 2 visible columns even though
+      it has ANSI escape bytes around it.
+    * ANSI escape sequences are preserved verbatim in the output so
+      colors are not severed mid-character. We never slice through an
+      escape's bytes.
+    * When truncation occurs, an ellipsis (``…``) is appended within
+      the visible budget and a final :data:`NC` reset is emitted so a
+      colored prefix can't bleed into the next line.
+    * Already-fitting strings are returned unchanged.
+    * ``max_cols <= 0`` returns the empty string (defensive default).
+
+    The result is guaranteed to have ``_visible_len(result) <= max_cols``."""
+    if max_cols <= 0:
+        return ""
+    if _visible_len(s) <= max_cols:
+        return s
+    budget = max_cols - 1  # reserve one column for the "…" indicator
+    out_parts: list[str] = []
+    visible = 0
+    pos = 0
+    for m in _ANSI_RE.finditer(s):
+        chunk = s[pos:m.start()]
+        for ch in chunk:
+            if visible >= budget:
+                return "".join(out_parts) + "…" + NC
+            out_parts.append(ch)
+            visible += 1
+        out_parts.append(m.group(0))
+        pos = m.end()
+    for ch in s[pos:]:
+        if visible >= budget:
+            return "".join(out_parts) + "…" + NC
+        out_parts.append(ch)
+        visible += 1
+    return "".join(out_parts)
+
+
+# ── Section: status ──────────────────────────────────────────────────────────
 
 
 # Color hints for the reconciled status column. Keep this map small so
@@ -66,13 +148,20 @@ def _or_dash(value: Any) -> str:
     return text
 
 
-def render_status_view(paths: RunPaths) -> str:
-    """Build the human-readable status block printed by ``ai show``.
+def _status_section_lines(paths: RunPaths) -> list[str]:
+    """Build the labelled status block as a list of lines (no trailing \\n).
 
-    Reads meta + state + reconciled status (the same triple ``ai ls``
-    uses) and renders an aligned key/value list plus a prompt preview.
-    Always returns a string with a trailing newline so callers can
-    ``sys.stdout.write`` it without fiddling with line endings."""
+    Two-column layout: short fields are paired so the section stays
+    bounded to roughly 9-10 lines even with a prompt preview. That
+    matters because :func:`run_live_show` has to fit status + recent
+    events + agent output inside the operator's terminal height; a
+    tall status block would push the lower sections off screen on a
+    24-row terminal.
+
+    Long-valued fields (timestamps, workspace) get their own line so
+    they aren't truncated. The prompt preview is collapsed to a single
+    line so a multi-line task description doesn't blow up the section
+    height."""
     meta = read_meta(paths) or {}
     try:
         state = read_json(paths.state)
@@ -81,47 +170,70 @@ def render_status_view(paths: RunPaths) -> str:
     status = reconcile_status(paths, meta, state=state)
     state = state or {}
 
-    fields: list[tuple[str, str]] = [
-        ("status", _status_str(status)),
-        ("phase", _or_dash(state.get("phase") or meta.get("status"))),
+    # Paired short fields. Each tuple is (left_label, left_value,
+    # right_label, right_value). Keep the list in operator-priority
+    # order so the eye finds the most important info first.
+    pairs: list[tuple[str, str, str, str]] = [
+        ("status", _status_str(status),
+         "phase", _or_dash(state.get("phase") or meta.get("status"))),
         ("outer/inner", f"{int(state.get('outer', 0) or 0)}/"
-                       f"{int(state.get('inner', 0) or 0)}"),
-        ("paused", _yes_no(state.get("paused"))),
-        ("approved", _yes_no(state.get("approved"))),
-        ("last verdict", _or_dash(state.get("last_verdict"))),
-        ("total reviews", _or_dash(state.get("total_reviews"))),
-        ("exit code", _or_dash(state.get("exit_code"))),
-        ("pid", _or_dash(meta.get("pid"))),
-        ("workspace", _or_dash(meta.get("workspace") or state.get("workspace"))),
+                        f"{int(state.get('inner', 0) or 0)}",
+         "paused", _yes_no(state.get("paused"))),
+        ("approved", _yes_no(state.get("approved")),
+         "last verdict", _or_dash(state.get("last_verdict"))),
+        ("total reviews", _or_dash(state.get("total_reviews")),
+         "exit code", _or_dash(state.get("exit_code"))),
+        ("pid", _or_dash(meta.get("pid")),
+         "workspace", _or_dash(meta.get("workspace") or state.get("workspace"))),
+    ]
+
+    # Long-valued solo fields stay on their own line.
+    solo: list[tuple[str, str]] = [
         ("started", _or_dash(meta.get("started_at") or state.get("started_at"))),
         ("updated", _or_dash(state.get("updated_at") or meta.get("heartbeat_at"))),
         ("finished", _or_dash(state.get("finished_at") or meta.get("finished_at"))),
     ]
 
-    label_w = max(len(label) for label, _ in fields)
-    out_lines: list[str] = []
-    title = f"{BOLD}Run {paths.run_id}{NC}"
-    out_lines.append(title)
-    out_lines.append(f"{DIM}{'─' * 60}{NC}")
-    for label, value in fields:
-        out_lines.append(f"{DIM}{label.ljust(label_w)}{NC}  {value}")
+    label_w_left = max(len(p[0]) for p in pairs)
+    label_w_right = max(len(p[2]) for p in pairs)
+    label_w_solo = max(len(label) for label, _ in solo)
+    # Visible-width pad for the left value so the right column's label
+    # always starts at the same offset. ANSI codes (e.g. _status_str's
+    # green wrap) are zero-width so we measure with _visible_len.
+    value_w_left = max(_visible_len(p[1]) for p in pairs)
+
+    lines: list[str] = [f"{BOLD}Run {paths.run_id}{NC}"]
+    for ll, lv, rl, rv in pairs:
+        left = f"{DIM}{ll.ljust(label_w_left)}{NC}  {_vpad(lv, value_w_left)}"
+        right = f"{DIM}{rl.ljust(label_w_right)}{NC}  {rv}"
+        lines.append(f"{left}    {right}")
+    for label, value in solo:
+        lines.append(f"{DIM}{label.ljust(label_w_solo)}{NC}  {value}")
 
     preview = (state.get("prompt_preview") or "").strip()
     if preview:
-        out_lines.append("")
-        out_lines.append(f"{BOLD}prompt{NC}")
-        for raw in preview.splitlines():
-            out_lines.append(f"  {raw}")
+        # Collapse newlines and truncate so the prompt occupies exactly
+        # one line. Multi-line tasks would otherwise inflate the status
+        # block past the screen budget the live renderer assumes.
+        flat = preview.replace("\n", " / ").replace("\r", " ").strip()
+        lines.append(f"{BOLD}prompt{NC}  {_truncate(flat, 100)}")
+    return lines
 
-    out_lines.append("")
-    out_lines.append(
-        f"{DIM}tip: ai show {paths.run_id} --json for raw state · "
-        f"--logs for agent log{NC}"
+
+def render_status_view(paths: RunPaths) -> str:
+    """Compatibility wrapper used by older callers and unit tests.
+
+    Returns the status block plus a trailing newline. The combined view
+    builds its own composite output via :func:`render_combined_view`."""
+    lines = _status_section_lines(paths)
+    lines.append("")
+    lines.append(
+        f"{DIM}tip: ai show {paths.run_id} --json for raw state{NC}"
     )
-    return "\n".join(out_lines) + "\n"
+    return "\n".join(lines) + "\n"
 
 
-# ── ``ai tail`` — compact event lines ─────────────────────────────────────────
+# ── Section: events ──────────────────────────────────────────────────────────
 
 
 # Per-event-type color hints. Match what operators expect to scan for
@@ -149,13 +261,11 @@ _EVENT_COLORS = {
 
 
 def _short_ts(ts: str) -> str:
-    """Trim ISO timestamps to ``HH:MM:SS`` for compact tail lines."""
+    """Trim ISO timestamps to ``HH:MM:SS`` for compact lines."""
     if not ts:
         return "--:--:--"
-    # Expect ``YYYY-MM-DDTHH:MM:SS[.us][+TZ]``; pull the time-of-day.
     if "T" in ts:
         time_part = ts.split("T", 1)[1]
-        # Trim sub-second + timezone tail (``12:34:56.789012+00:00``).
         for stop in (".", "+", "-", "Z"):
             if stop in time_part:
                 time_part = time_part.split(stop, 1)[0]
@@ -178,7 +288,7 @@ def render_event(evt: dict, *, color: bool = True) -> str:
 
     The summary captures the most useful free-text payload (guidance
     text, prompt preview, error reason) so the operator doesn't have to
-    drop into ``--raw`` to see what just happened."""
+    drop into raw JSON to see what just happened."""
     ts = _short_ts(str(evt.get("timestamp", "")))
     typ = str(evt.get("type", "?"))
     seq = evt.get("seq")
@@ -236,25 +346,375 @@ def render_events(events: Iterable[dict], *, color: bool = True) -> str:
     return "\n".join(render_event(e, color=color) for e in events)
 
 
-# ── ``ai show --logs`` / ``ai tail --agent-log`` ──────────────────────────────
+def _events_section_lines(paths: RunPaths, *, lines: int) -> list[str]:
+    """Build the recent-events section. Returns an empty placeholder
+    section when nothing has been written yet so the section header
+    stays in place across refreshes.
+
+    The bold header alone separates this from the status section above
+    — we deliberately drop a separator rule so the live renderer's
+    fixed overhead stays small enough that all three sections fit on a
+    24-row terminal."""
+    out: list[str] = [
+        f"{BOLD}Recent events{NC}  {DIM}(last {lines}){NC}",
+    ]
+    events = tail_events(paths.events, n=max(1, lines))
+    if not events:
+        out.append(f"{DIM}(no events yet){NC}")
+        return out
+    for evt in events:
+        out.append(render_event(evt))
+    return out
+
+
+# ── Section: agent output ────────────────────────────────────────────────────
+
+
+def tail_text_file(
+    path: Path,
+    *,
+    lines: int = 30,
+    chunk_per_line: int = 4096,
+) -> list[str]:
+    """Return the last *lines* of *path* without reading the whole file.
+
+    For large agent transcripts (which can grow to many MiB over a long
+    run) we only sip the tail. We over-read by ``lines * chunk_per_line``
+    bytes which is enough for any reasonable line length; if a single
+    line is longer than that we still get the *content* of the last
+    line, just possibly truncated at the front. That tradeoff is worth
+    keeping the reader cheap and bounded.
+
+    Returns ``[]`` for a missing or empty file so callers can render a
+    friendly placeholder."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    if size == 0:
+        return []
+    chunk = max(1, lines) * max(64, chunk_per_line)
+    try:
+        with path.open("rb") as f:
+            if size > chunk:
+                f.seek(size - chunk)
+                data = f.read()
+                # The seek likely landed mid-line, so drop everything
+                # up to and including the first newline in our window.
+                # If the window contains *no* newline at all (e.g. the
+                # log is one giant line that hasn't been flushed with a
+                # \n yet, or a single line longer than ``chunk``), keep
+                # the bytes we have rather than discarding them — the
+                # docstring promises a truncated tail in that case, not
+                # an empty result.
+                nl = data.find(b"\n")
+                if nl != -1:
+                    data = data[nl + 1 :]
+            else:
+                data = f.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    out = text.splitlines()
+    if not out:
+        return []
+    return out[-max(1, lines) :]
+
+
+def _agent_output_section_lines(paths: RunPaths, *, lines: int) -> list[str]:
+    """Build the agent-output section.
+
+    The label says "agent output" rather than "agent.log" so users stop
+    treating the file path as the workflow. Like the events section,
+    we keep the per-section overhead to a single header line so the
+    live combined view fits in a 24-row terminal."""
+    out: list[str] = [
+        f"{BOLD}Agent output{NC}  {DIM}(last {lines}){NC}",
+    ]
+    if not paths.agent_log.exists():
+        out.append(f"{DIM}(agent has not produced output yet){NC}")
+        return out
+    tail = tail_text_file(paths.agent_log, lines=lines)
+    if not tail:
+        out.append(f"{DIM}(agent output is empty){NC}")
+        return out
+    for raw in tail:
+        # Render lines verbatim; stripping trailing whitespace is fine
+        # but never strip leading whitespace (indentation can matter
+        # in tracebacks, diffs, etc.).
+        out.append(raw.rstrip("\r"))
+    return out
 
 
 def render_agent_log_tail(paths: RunPaths, *, lines: int = 50) -> str:
-    """Return the last *lines* of ``logs/agent.log``, or a friendly placeholder.
+    """Compatibility wrapper for callers that want only the agent log.
 
-    The agent log is the raw subprocess transcript and may be huge; we
-    only ever read the tail. Missing-file is a normal condition before
-    the runner has emitted anything, so we surface that explicitly
-    instead of raising."""
+    The combined view embeds this through :func:`_agent_output_section_lines`;
+    this helper exists for the deprecated ``ai tail --agent-log`` shim and
+    for tests that exercise just the agent-output rendering. Returns a
+    string with a trailing newline so callers can ``sys.stdout.write`` it
+    without fiddling."""
+    section = _agent_output_section_lines(paths, lines=lines)
+    return "\n".join(section) + "\n"
+
+
+# ── Combined view + live runner ──────────────────────────────────────────────
+
+
+def render_combined_view(
+    paths: RunPaths,
+    *,
+    event_lines: int = 12,
+    log_lines: int = 30,
+    cols: Optional[int] = None,
+) -> str:
+    """Render the full ``ai show`` view as a single string.
+
+    Three sections separated by a blank line: status, recent events,
+    agent output. Always returns a string with a trailing newline so
+    callers can ``sys.stdout.write`` it directly.
+
+    When *cols* is provided each rendered line is truncated to that
+    many visible columns via :func:`_truncate_visible` so the live
+    renderer's row-budgeted layout can't be defeated by long workspace
+    paths or unbroken agent-output lines wrapping into multiple
+    physical rows. Tabs are expanded before measurement so each visible
+    character corresponds to exactly one column on the terminal.
+
+    The one-shot/non-TTY callers leave *cols* as ``None`` so piped
+    output remains lossless — wrapping doesn't matter when the
+    consumer is a file or another program."""
+    blocks: list[str] = []
+    blocks.append("\n".join(_status_section_lines(paths)))
+    blocks.append("\n".join(_events_section_lines(paths, lines=event_lines)))
+    blocks.append("\n".join(_agent_output_section_lines(paths, lines=log_lines)))
+    text = "\n\n".join(blocks)
+    if cols is not None and cols > 0:
+        text = "\n".join(
+            _truncate_visible(line.expandtabs(8), cols)
+            for line in text.split("\n")
+        )
+    return text + "\n"
+
+
+# Number of "fixed" rows the combined view consumes besides the
+# status section's lines and the per-section content rows. Made up of:
+#
+#   2 blank lines between the three sections (rendered by ``\n\n.join``)
+#   1 line for the recent-events section header
+#   1 line for the agent-output section header
+#   2 lines for the live-view footer (one blank + one footer line)
+#
+# Kept as a module constant so :func:`fit_section_caps` and any
+# future renderer agree on the geometry without re-deriving it.
+_LIVE_VIEW_OVERHEAD = 6
+
+
+def fit_section_caps(
+    paths: RunPaths,
+    *,
+    rows: int,
+    requested_event_lines: int,
+    requested_log_lines: int,
+) -> Tuple[int, int]:
+    """Pick ``(event_lines, log_lines)`` so the live view fits in *rows*.
+
+    The status section is always rendered in full — it's the stable
+    anchor at the top of the screen. The remaining vertical budget,
+    after accounting for blank gaps, section headers and the footer,
+    is split between recent events and agent output:
+
+    * About a third goes to recent events so they don't drown in agent
+      transcript, capped at ``requested_event_lines``.
+    * The rest goes to agent output, capped at ``requested_log_lines``.
+    * Each section gets at least one content line so its header never
+      sits alone over an empty body.
+
+    On absurdly tight terminals (or if the status section by itself
+    already overflows) we still return ``(1, 1)`` rather than zero —
+    the live renderer knows what to do, and a partially-truncated view
+    is better than a missing one."""
+    status_h = len(_status_section_lines(paths))
+    available = max(0, int(rows) - status_h - _LIVE_VIEW_OVERHEAD)
+    req_e = max(1, int(requested_event_lines))
+    req_l = max(1, int(requested_log_lines))
+    if available <= 2:
+        return (1, 1)
+    # Roughly 1/3 for events, the rest for agent output. The min-1
+    # floor keeps each section visually present.
+    events = min(req_e, max(1, available // 3))
+    logs = min(req_l, max(1, available - events))
+    # If the user requested fewer events than budget allows, hand the
+    # leftover to agent output (still capped at the user's request).
+    leftover = available - events - logs
+    if leftover > 0 and logs < req_l:
+        logs = min(req_l, logs + leftover)
+    return (events, logs)
+
+
+# ANSI control sequences for the live renderer. Kept as module
+# constants so they're easy to grep for and easy to no-op in tests
+# (the live runner accepts a custom ``out`` so capsys-style harnesses
+# never see the raw escape bytes).
+_ALT_SCREEN_ON = "\033[?1049h"
+_ALT_SCREEN_OFF = "\033[?1049l"
+_HIDE_CURSOR = "\033[?25l"
+_SHOW_CURSOR = "\033[?25h"
+_CLEAR_HOME = "\033[H\033[2J"
+
+
+def _default_get_size() -> Tuple[int, int]:
+    """Return ``(columns, rows)`` for the controlling terminal.
+
+    Wraps :func:`shutil.get_terminal_size` so tests can monkeypatch
+    a deterministic size without poking environment variables. The
+    fallback ``(80, 24)`` matches the canonical small-terminal we
+    optimise the layout for."""
+    sz = shutil.get_terminal_size((80, 24))
+    return (sz.columns, sz.lines)
+
+
+def run_live_show(
+    paths: RunPaths,
+    *,
+    event_lines: int = 12,
+    log_lines: int = 30,
+    refresh_seconds: float = 0.4,
+    out=None,
+    sleep: Callable[[float], None] = time.sleep,
+    should_continue: Optional[Callable[[int], bool]] = None,
+    use_alt_screen: bool = True,
+    get_size: Optional[Callable[[], Tuple[int, int]]] = None,
+) -> int:
+    """Repaint the combined view on a polling timer until interrupted.
+
+    The renderer is deliberately simple and stdlib-only:
+
+    * Switches to the alternate screen buffer (so the operator's
+      scrollback is not polluted) and hides the cursor.
+    * Each tick: home cursor, clear screen, redraw the combined view
+      sized to the terminal so status + events + agent output all
+      stay on screen, and print a single-line footer.
+    * Polls ``state.json`` / ``events.jsonl`` / ``logs/agent.log`` —
+      no inotify, no daemon, no contention with the writer.
+    * Exits cleanly on ``KeyboardInterrupt`` (Ctrl-C) and always
+      restores cursor + alternate-screen state before returning.
+
+    Each iteration re-measures the terminal via *get_size* (defaults to
+    :func:`shutil.get_terminal_size`) so a window resize takes effect
+    on the next tick. The requested ``event_lines`` / ``log_lines``
+    are treated as upper bounds: :func:`fit_section_caps` shrinks them
+    to fit available rows, but never grows them past the user's
+    request.
+
+    The ``should_continue`` / ``sleep`` / ``get_size`` hooks are for
+    tests: they let us drive the loop deterministically without
+    touching a real terminal or wall clock."""
+    if out is None:
+        out = sys.stdout
+    if get_size is None:
+        get_size = _default_get_size
+
+    if use_alt_screen:
+        out.write(_ALT_SCREEN_ON)
+    out.write(_HIDE_CURSOR)
     try:
-        with paths.agent_log.open("r", encoding="utf-8", errors="replace") as fh:
-            buf = fh.readlines()
-    except FileNotFoundError:
-        return f"(no agent log yet at {paths.agent_log})\n"
-    if not buf:
-        return f"(agent log is empty: {paths.agent_log})\n"
-    tail = buf[-max(1, lines):]
-    return "".join(tail)
+        out.flush()
+    except (AttributeError, OSError):
+        pass
+
+    interrupted = False
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            try:
+                cols, rows = get_size()
+            except OSError:
+                # Terminal size lookup can fail mid-run on weird ttys;
+                # fall back to an 80x24 layout rather than blowing up.
+                cols, rows = 80, 24
+            cols = max(1, int(cols))
+            fitted_events, fitted_logs = fit_section_caps(
+                paths,
+                rows=int(rows),
+                requested_event_lines=event_lines,
+                requested_log_lines=log_lines,
+            )
+            # Pass ``cols`` so each rendered line is truncated to the
+            # terminal width — without this a single long agent-output
+            # line or a long workspace path would wrap to a second
+            # physical row and break the row budget that
+            # :func:`fit_section_caps` worked out, scrolling status or
+            # events off screen.
+            view = render_combined_view(
+                paths,
+                event_lines=fitted_events,
+                log_lines=fitted_logs,
+                cols=cols,
+            )
+            footer_text = (
+                f"{DIM}[ Ctrl-C to exit · refreshing every "
+                f"{refresh_seconds:.2f}s ]{NC}"
+            )
+            # Footer geometry: one blank separator row + one footer
+            # row = 2 visible rows, exactly the budget reserved by
+            # ``_LIVE_VIEW_OVERHEAD``. We deliberately do NOT emit a
+            # trailing newline after the footer text. With the perfect
+            # 24-row fit, the footer lands on the bottom row; a final
+            # ``\n`` would advance the cursor off the screen, which
+            # most terminals turn into a scroll — silently knocking
+            # the top status row out of view tick after tick. Leaving
+            # the cursor parked at the end of the footer row is safe:
+            # the next iteration's ``_CLEAR_HOME`` repositions it to
+            # (1,1) before the next redraw begins.
+            footer = "\n" + _truncate_visible(footer_text, cols)
+            out.write(_CLEAR_HOME)
+            out.write(view)
+            out.write(footer)
+            try:
+                out.flush()
+            except (AttributeError, OSError):
+                pass
+
+            if should_continue is not None and not should_continue(iteration):
+                break
+            try:
+                sleep(max(0.05, float(refresh_seconds)))
+            except KeyboardInterrupt:
+                interrupted = True
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        out.write(_SHOW_CURSOR)
+        if use_alt_screen:
+            out.write(_ALT_SCREEN_OFF)
+        try:
+            out.flush()
+        except (AttributeError, OSError):
+            pass
+
+    # After leaving the alternate screen the user expects to see *some*
+    # final state on the regular screen so the run isn't invisible
+    # post-exit. Print one final snapshot — the combined view, plus an
+    # explicit "exited" hint when the user pressed Ctrl-C — so the
+    # transcript records what was on screen. The post-exit snapshot
+    # uses the user's requested caps (not the fitted ones), since it
+    # ends up in regular scrollback where vertical room isn't bounded.
+    if use_alt_screen:
+        out.write(render_combined_view(
+            paths,
+            event_lines=max(1, event_lines),
+            log_lines=max(1, log_lines),
+        ))
+        if interrupted:
+            out.write(f"{DIM}(exited live view){NC}\n")
+        try:
+            out.flush()
+        except (AttributeError, OSError):
+            pass
+    return 0
 
 
 # ── State JSON helpers (kept here so ``--json`` paths share a formatter) ──────
@@ -278,9 +738,13 @@ def state_json_text(paths: RunPaths) -> str:
 
 
 __all__ = [
+    "fit_section_caps",
     "render_status_view",
     "render_event",
     "render_events",
     "render_agent_log_tail",
+    "render_combined_view",
+    "run_live_show",
     "state_json_text",
+    "tail_text_file",
 ]
