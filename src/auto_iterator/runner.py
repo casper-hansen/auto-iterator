@@ -4,7 +4,7 @@ This module owns the semantic loop: *implement* → *outer loop* → *inner
 loop of review + fix* → *fresh-eyes validation* → *summary*. On top of
 the original behaviour it now:
 
-* emits a ``events.jsonl`` stream for ``ai tail``;
+* emits an ``events.jsonl`` stream that ``ai show`` reads;
 * refreshes ``state.json`` after every meaningful transition;
 * drains operator control files at ``inner_started`` boundaries only (so
   we never reach into a live agent stream);

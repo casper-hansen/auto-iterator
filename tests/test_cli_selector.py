@@ -7,8 +7,6 @@ Covers the spec acceptance criteria without requiring a real terminal:
 * Explicit ``run_id`` still bypasses selector resolution.
 * The selector resolution path picks a ``RunRow`` and sets
   ``args.run_id`` before the existing handler runs.
-* ``ai tail`` defaults to 50 events while still respecting an explicit
-  ``--lines``; with no scripting flags it delegates to ``ai show``.
 * ``ai show`` default (non-TTY) output is the combined status + events
   + agent-output view; it does *not* dump raw JSON.
 * ``ai show --json`` remains parseable JSON.
@@ -65,7 +63,6 @@ def test_parser_accepts_omitted_run_id_for_selector_commands() -> None:
         "restart": ["restart"],
         "kill": ["kill"],
         "show": ["show"],
-        "tail": ["tail"],
         "send": ["send", "guidance text"],
         "rewind": ["rewind", "--to", "outer=1,inner=1"],
         "set-prompt": ["set-prompt", "--text", "new"],
@@ -98,29 +95,6 @@ def test_parser_explicit_run_id_still_works() -> None:
     assert ns.run_id == "abc123"
     assert ns.force is True
     print("  test_parser_explicit_run_id_still_works PASS")
-
-
-def test_tail_default_lines_is_50() -> None:
-    """Spec change: ``tail`` default went from 200 → 50."""
-    p = _build_parser()
-    ns = p.parse_args(["tail", "rid"])
-    assert ns.lines == 50
-    ns_explicit = p.parse_args(["tail", "rid", "--lines", "200"])
-    assert ns_explicit.lines == 200
-    print("  test_tail_default_lines_is_50 PASS")
-
-
-def test_tail_agent_log_and_raw_flags() -> None:
-    p = _build_parser()
-    ns = p.parse_args(["tail", "rid", "--agent-log"])
-    assert ns.agent_log is True
-    ns = p.parse_args(["tail", "rid", "--raw"])
-    assert ns.raw is True
-    # ``--json`` is an alias for ``--raw`` to match the documented
-    # scripting contract; both must populate the same dest.
-    ns = p.parse_args(["tail", "rid", "--json"])
-    assert ns.raw is True
-    print("  test_tail_agent_log_and_raw_flags PASS")
 
 
 def test_send_parses_all_positional_orderings() -> None:
@@ -460,210 +434,6 @@ def test_show_handles_empty_agent_log(capsys) -> None:
     assert "Agent output" in out
     assert "agent output is empty" in out
     print("  test_show_handles_empty_agent_log PASS")
-
-
-def test_tail_default_delegates_to_show(capsys, monkeypatch) -> None:
-    """``ai tail RUN_ID`` (no flags) emits the same combined view as show.
-
-    The deprecation note (when stderr is a TTY) goes to stderr; the
-    rendered combined view goes to stdout — both readable, no raw JSON."""
-    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
-    with tempfile.TemporaryDirectory() as tmp:
-        paths = _seed_run(Path(tmp))
-        paths.agent_log.write_text("agent transcript\n", encoding="utf-8")
-        rc = main(["--runs-dir", tmp, "tail", paths.run_id])
-    out = capsys.readouterr().out
-    assert rc == EXIT_OK
-    assert out, "tail emitted nothing"
-    for line in out.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        assert not line.startswith("{"), \
-            f"default tail must not emit JSON lines, got: {line!r}"
-    # Combined view sections all present — proves the redirect, not
-    # the old standalone tail renderer, ran.
-    assert "Run " in out
-    assert "Recent events" in out
-    assert "Agent output" in out
-    assert "run_started" in out
-    assert "review_finished" in out
-    assert "agent transcript" in out
-    print("  test_tail_default_delegates_to_show PASS")
-
-
-def test_tail_raw_emits_jsonl(capsys) -> None:
-    """Scripting path: ``--raw`` keeps emitting raw events.jsonl lines."""
-    with tempfile.TemporaryDirectory() as tmp:
-        paths = _seed_run(Path(tmp))
-        rc = main(["--runs-dir", tmp, "tail", paths.run_id, "--raw"])
-    out = capsys.readouterr().out
-    assert rc == EXIT_OK
-    seqs = []
-    for line in out.strip().splitlines():
-        obj = json.loads(line)
-        seqs.append(obj.get("seq"))
-    assert seqs == sorted(seqs) and len(seqs) >= 3
-    print("  test_tail_raw_emits_jsonl PASS")
-
-
-def test_tail_from_seq_emits_raw_jsonl_without_raw_flag(capsys) -> None:
-    """Reviewer regression: ``--from-seq`` is scripting-only.
-
-    Previously ``ai tail --from-seq 0`` (no ``--raw``) emitted rendered
-    event lines through a separate code path, keeping a second
-    observation renderer alive on the ``ai tail`` side. The contract
-    is now that any of the scripting flags (``--raw`` /
-    ``--from-seq`` / ``--type``) always produces raw JSONL on stdout
-    so jq pipelines work without explicit ``--raw`` and there is no
-    rendered events stream lurking outside ``ai show``."""
-    with tempfile.TemporaryDirectory() as tmp:
-        paths = _seed_run(Path(tmp))
-        rc = main([
-            "--runs-dir", tmp, "tail", paths.run_id, "--from-seq", "0",
-        ])
-    out = capsys.readouterr().out
-    assert rc == EXIT_OK
-    lines = [l for l in out.strip().splitlines() if l]
-    assert lines, "expected at least one event"
-    seqs = []
-    for line in lines:
-        # Every emitted line must parse as a JSON object — no rendered
-        # text mixed in.
-        obj = json.loads(line)
-        assert isinstance(obj, dict)
-        seqs.append(obj.get("seq"))
-    assert seqs == sorted(seqs)
-    print("  test_tail_from_seq_emits_raw_jsonl_without_raw_flag PASS")
-
-
-def test_tail_type_emits_raw_jsonl_without_raw_flag(capsys) -> None:
-    """``--type FOO`` (no ``--raw``) also goes through the scripting
-    raw-JSONL path, with the type filter applied."""
-    with tempfile.TemporaryDirectory() as tmp:
-        paths = _seed_run(Path(tmp))
-        rc = main([
-            "--runs-dir", tmp, "tail", paths.run_id,
-            "--type", "review_finished",
-        ])
-    out = capsys.readouterr().out
-    assert rc == EXIT_OK
-    lines = [l for l in out.strip().splitlines() if l]
-    assert lines, "expected the filtered event"
-    types = []
-    for line in lines:
-        # Raw JSONL only — never a rendered "review_finished" text line.
-        obj = json.loads(line)
-        types.append(obj.get("type"))
-    assert set(types) == {"review_finished"}
-    print("  test_tail_type_emits_raw_jsonl_without_raw_flag PASS")
-
-
-def test_tail_is_alias_for_show_live() -> None:
-    """``ai tail RUN_ID`` is now a true alias for ``ai show RUN_ID``.
-
-    Reviewer regression: the previous translation forced ``once=True``
-    unless ``--follow`` was passed, which left plain ``ai tail RID``
-    as a one-shot snapshot in a TTY while the deprecation note told
-    operators it would be live. ``_show_args_from_tail`` now always
-    leaves ``once=False`` and lets ``cmd_show`` decide between live
-    and one-shot from the TTY check — exactly the same rule as
-    ``ai show``."""
-    import argparse
-
-    from auto_iterator.cli import _show_args_from_tail
-
-    base = argparse.Namespace(
-        run_id="rid", lines=50, follow=False, agent_log=False,
-        from_seq=None, types=[], raw=False,
-    )
-    # No flags: ``cmd_show`` (not this helper) decides live vs. one-shot.
-    assert _show_args_from_tail(base).once is False
-
-    # ``--follow`` is a deprecated no-op; the once value must not flip
-    # depending on it.
-    followed = argparse.Namespace(**{**vars(base), "follow": True})
-    assert _show_args_from_tail(followed).once is False
-
-    # ``--agent-log --lines N`` still maps the explicit cap onto the
-    # agent-output section so legacy invocations keep their tail size.
-    agent_log = argparse.Namespace(
-        **{**vars(base), "agent_log": True, "lines": 10},
-    )
-    out = _show_args_from_tail(agent_log)
-    assert out.once is False
-    assert out.log_lines == 10
-    print("  test_tail_is_alias_for_show_live PASS")
-
-
-def test_main_tail_default_drives_live_show(monkeypatch) -> None:
-    """End-to-end: ``ai tail RUN_ID`` (no flags) reaches ``run_live_show``.
-
-    The reviewer-blocking gap was that plain ``ai tail`` stayed
-    one-shot in a TTY while ``ai show`` was live by default. We pin
-    stdout to a TTY so ``cmd_show`` doesn't take the non-TTY one-shot
-    escape, then patch ``run_live_show`` to record the call instead
-    of redrawing a real terminal. Hitting that patch proves the
-    compat alias actually delegates to the live renderer.
-
-    ``--follow`` (now a deprecated no-op) is asserted on the same
-    path so removing it later is a single-line change."""
-    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
-    monkeypatch.setattr(sys.stderr, "isatty", lambda: False, raising=False)
-
-    calls: list[dict] = []
-
-    def fake_live(paths, *, event_lines, log_lines, refresh_seconds, **_):
-        calls.append({
-            "run_id": paths.run_id,
-            "event_lines": event_lines,
-            "log_lines": log_lines,
-            "refresh_seconds": refresh_seconds,
-        })
-        return EXIT_OK
-
-    monkeypatch.setattr(
-        "auto_iterator.display.run_live_show", fake_live, raising=True,
-    )
-    with tempfile.TemporaryDirectory() as tmp:
-        paths = _seed_run(Path(tmp))
-        # Plain ``ai tail RID`` must hit the live renderer in a TTY.
-        rc = main(["--runs-dir", tmp, "tail", paths.run_id])
-        # And ``--follow`` must keep doing the same thing — it's a
-        # deprecated no-op now.
-        rc_follow = main(
-            ["--runs-dir", tmp, "tail", paths.run_id, "--follow"],
-        )
-    assert rc == EXIT_OK
-    assert rc_follow == EXIT_OK
-    assert len(calls) == 2, f"expected two live-render calls, got {calls!r}"
-    assert calls[0]["run_id"] == paths.run_id
-    assert calls[1]["run_id"] == paths.run_id
-    print("  test_main_tail_default_drives_live_show PASS")
-
-
-def test_tail_agent_log_redirects_to_show(capsys, monkeypatch) -> None:
-    """``ai tail --agent-log --lines N`` is folded into the combined view.
-
-    The combined view embeds the agent transcript, so passing
-    ``--agent-log`` after the deprecation simply redirects to ``ai
-    show`` while honouring the explicit ``--lines`` cap on the
-    agent-output section."""
-    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
-    with tempfile.TemporaryDirectory() as tmp:
-        paths = _seed_run(Path(tmp))
-        paths.agent_log.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
-        rc = main([
-            "--runs-dir", tmp, "tail", paths.run_id, "--agent-log",
-            "--lines", "2",
-        ])
-    out = capsys.readouterr().out
-    assert rc == EXIT_OK
-    # Combined view showed up with the explicit log-lines cap honoured.
-    assert "Agent output" in out
-    assert "gamma" in out and "beta" in out
-    assert "alpha" not in out  # truncated by the 2-line cap
-    print("  test_tail_agent_log_redirects_to_show PASS")
 
 
 def test_main_show_no_runs_exits_user_error(capsys) -> None:

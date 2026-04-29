@@ -4,13 +4,14 @@ Every meaningful state transition in the runner produces a JSON object that
 is both appended to ``events.jsonl`` and folded into the latest snapshot in
 ``state.json``. Keeping both forms on disk means:
 
-* ``tail --follow`` works off ``events.jsonl`` — a plain append-only log
-  that no reader ever has to seek backwards in.
+* ``events.jsonl`` is a plain append-only log that no reader ever has to
+  seek backwards in, so jq-style scripting against the raw stream stays
+  trivial.
 * ``ai show`` / ``ai ls`` get the current state in O(1) by reading the
   tiny ``state.json`` snapshot, without replaying the full event log.
 
 Event shape: ``{"seq": N, "type": "...", "timestamp": "...", ...}``. The
-``seq`` field monotonically increases so ``tail --from-seq K`` can pick up
+``seq`` field monotonically increases so a resuming reader can pick up
 where it left off after a disconnect.
 """
 
@@ -28,9 +29,9 @@ from .run_dir import RunPaths, append_jsonl, atomic_write_json, now_iso
 # The set of event types the runner emits. Kept as a frozenset (rather
 # than inline magic strings in every ``log.emit`` call site) so a grep
 # turns up the full vocabulary, tests can assert against it, and future
-# additions have an obvious home. The CLI's ``--type`` filter accepts
-# any string today; we don't reject unknowns so downstream tooling can
-# add new event types without pinning the CLI's version.
+# additions have an obvious home. Downstream tooling can add new event
+# types without pinning the CLI's version because consumers read raw
+# JSONL and don't need a closed enum.
 EVENT_TYPES = frozenset({
     "run_started",
     "run_finished",
@@ -51,11 +52,6 @@ EVENT_TYPES = frozenset({
     "control_rejected",
     "outer_finished",
 })
-
-
-# Terminal event types for ``tail --follow`` — once one of these lands the
-# follower can exit cleanly instead of blocking forever on inotify.
-TERMINAL_EVENT_TYPES = frozenset({"run_finished"})
 
 
 @dataclass
@@ -187,8 +183,9 @@ class EventLog:
 
         Separate from ``events.jsonl`` because operator intents and runner
         events are two different audit lenses; keeping them in separate
-        files lets ``tail --follow`` stay focused on runner progress while
-        ``ai send --wait`` can watch the audit log without noise."""
+        files lets readers of ``events.jsonl`` stay focused on runner
+        progress while ``ai send --wait`` can watch the audit log
+        without noise."""
         append_jsonl(self.paths.control_applied, {
             "timestamp": now_iso(),
             **payload,
@@ -216,27 +213,3 @@ def tail_events(path: Path, n: int = 200) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
     return out
-
-
-def iter_events_from_seq(path: Path, from_seq: int):
-    """Yield events with ``seq > from_seq`` from *path*.
-
-    Used by the ``tail --follow`` reader when an operator wants to resume
-    from a known point (after a reconnect, a crash, or a session switch).
-    Non-dict / missing-seq lines are skipped silently."""
-    try:
-        fh = path.open("r", encoding="utf-8", errors="replace")
-    except FileNotFoundError:
-        return
-    with fh as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                evt = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            seq = evt.get("seq")
-            if isinstance(seq, int) and seq > from_seq:
-                yield evt

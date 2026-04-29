@@ -446,18 +446,6 @@ def _agent_output_section_lines(paths: RunPaths, *, lines: int) -> list[str]:
     return out
 
 
-def render_agent_log_tail(paths: RunPaths, *, lines: int = 50) -> str:
-    """Compatibility wrapper for callers that want only the agent log.
-
-    The combined view embeds this through :func:`_agent_output_section_lines`;
-    this helper exists for the deprecated ``ai tail --agent-log`` shim and
-    for tests that exercise just the agent-output rendering. Returns a
-    string with a trailing newline so callers can ``sys.stdout.write`` it
-    without fiddling."""
-    section = _agent_output_section_lines(paths, lines=lines)
-    return "\n".join(section) + "\n"
-
-
 # ── Combined view + live runner ──────────────────────────────────────────────
 
 
@@ -742,7 +730,6 @@ __all__ = [
     "render_status_view",
     "render_event",
     "render_events",
-    "render_agent_log_tail",
     "render_combined_view",
     "run_live_show",
     "state_json_text",

@@ -15,11 +15,9 @@ Subcommand families
 it draws a continuously-refreshing combined view (status + recent
 structured events + tail of the agent transcript) and exits cleanly
 on Ctrl-C; outside a TTY it produces a one-shot text version of the
-same combined view. ``ai tail`` is preserved only as a deprecated
-alias whose default path delegates to ``ai show`` (so plain
-``ai tail RID`` is the same live view as ``ai show RID``); its
-``--raw`` / ``--from-seq`` / ``--type`` flags remain as a raw-JSONL
-escape hatch for jq-style scripting against ``events.jsonl``.
+same combined view. Scripting against the raw event stream is done by
+reading ``events.jsonl`` directly — the CLI does not expose a
+rendered events-only view.
 
 Exit codes follow the spec:
 ``0`` success / ``1`` user error / ``2`` IO or permission error /
@@ -40,7 +38,6 @@ from typing import Callable, Iterable, Optional
 
 from .backends import BACKENDS, get_backend
 from .control import parse_rewind_to
-from .events import TERMINAL_EVENT_TYPES, iter_events_from_seq, tail_events
 from .feature.config import RunConfig
 from .ls import list_runs, summarize_run
 from .meta import read_meta, update_meta
@@ -250,42 +247,6 @@ def _build_parser() -> argparse.ArgumentParser:
     # any scripts that still invoke it keep producing readable output.
     show_p.add_argument("--logs", action="store_true",
                         help=argparse.SUPPRESS)
-
-    # ── tail (deprecated alias for show) ──
-    # ``ai tail`` is no longer a separate observation experience. It
-    # delegates to ``ai show`` for the rendered/live path; the raw
-    # event-stream flags remain for jq-style scripting because there is
-    # no other place to read raw ``events.jsonl`` lines through the CLI.
-    tail_p = sub.add_parser(
-        "tail",
-        help="DEPRECATED: alias for `ai show`. Use `ai show RUN_ID`.",
-        description=(
-            "Deprecated alias for `ai show`. The default rendered output "
-            "is now the combined live view. The --raw / --from-seq / --type "
-            "flags remain available for scripts that need to read "
-            "events.jsonl directly."
-        ),
-    )
-    tail_p.add_argument("run_id", nargs="?")
-    tail_p.add_argument("--lines", type=int, default=50,
-                        help="Last N events to emit (default 50). "
-                             "Used by the rendered path and by --raw "
-                             "scripting output.")
-    tail_p.add_argument("--follow", action="store_true",
-                        help="Deprecated no-op; `ai show` (and the "
-                             "default `ai tail` redirect) are already "
-                             "live in a TTY.")
-    tail_p.add_argument("--from-seq", type=int, default=None,
-                        help="Scripting: start from events with seq > K. "
-                             "Always emits raw JSONL (no rendered view).")
-    tail_p.add_argument("--type", action="append", default=[], dest="types",
-                        help="Scripting filter (repeatable). Always "
-                             "emits raw JSONL (no rendered view).")
-    tail_p.add_argument("--raw", "--json", action="store_true", dest="raw",
-                        help="Scripting: emit raw events.jsonl lines.")
-    tail_p.add_argument("--agent-log", action="store_true",
-                        help="Deprecated; `ai show` already includes the "
-                             "agent transcript.")
 
     # ── send ──
     # Both positionals are ``nargs="?"`` so argparse can parse the four
@@ -593,7 +554,7 @@ def _print_ls_table(rows: list) -> None:
 
 
 def _stdout_is_tty() -> bool:
-    """Single check used by show/tail dispatchers; tolerates patched sys.stdout."""
+    """Single check used by the show dispatcher; tolerates patched sys.stdout."""
     try:
         return bool(sys.stdout.isatty())
     except (AttributeError, OSError):
@@ -626,8 +587,7 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
     log_lines = max(1, log_lines_default)
     if getattr(args, "lines", None) is not None:
         # Backwards-compat alias: ``--lines`` continues to control the
-        # agent-output tail size (matching the deprecated
-        # ``--logs``/``--lines`` pairing).
+        # agent-output tail size.
         log_lines = max(1, int(args.lines))
 
     once = bool(getattr(args, "once", False) or getattr(args, "logs", False))
@@ -646,161 +606,6 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
         log_lines=log_lines,
         refresh_seconds=refresh,
     )
-
-
-def _show_args_from_tail(args: argparse.Namespace) -> argparse.Namespace:
-    """Translate ``ai tail`` args into the equivalent ``ai show`` args.
-
-    The rendered tail path is folded entirely into :func:`cmd_show`,
-    so ``ai tail RUN_ID`` is a true alias for ``ai show RUN_ID``: live
-    combined view in a TTY, one-shot rendered text otherwise. This
-    helper only exists to translate ``ai tail``'s legacy ``--lines`` /
-    ``--agent-log`` / ``--follow`` knobs into ``ai show``'s vocabulary.
-
-    Translation rules:
-
-    * ``ai tail --lines N`` (old: last N events) → ``event_lines=N``
-      so the rendered events section grows accordingly.
-    * ``ai tail --agent-log --lines N`` (old: last N agent log lines)
-      → ``log_lines=N`` so the agent-output section honours the
-      explicit cap.
-    * ``ai tail --follow`` is a deprecated no-op: ``cmd_show`` already
-      enters the live combined-view loop in a TTY by default.
-
-    ``once`` is left ``False`` here so :func:`cmd_show` decides between
-    live and one-shot purely based on whether stdout is a TTY — the
-    same rule it uses for ``ai show RUN_ID``. That parity is the whole
-    point of the deprecation: there is no longer a separate "tail UX"
-    that diverges from ``show``.
-
-    The tail-only scripting flags (``--raw``, ``--from-seq``,
-    ``--type``) are handled directly in :func:`cmd_tail` and never
-    reach this helper."""
-    is_agent_log = bool(getattr(args, "agent_log", False))
-    requested = max(1, int(args.lines or 50))
-    return argparse.Namespace(
-        cmd="show",
-        run_id=args.run_id,
-        json=False,
-        # ``ai tail`` is now a thin alias for ``ai show``. We never
-        # force the one-shot path here: ``cmd_show`` picks live vs.
-        # one-shot from the TTY check, and ``--follow`` is therefore
-        # redundant. Both ``ai tail RID`` and ``ai tail --follow RID``
-        # land on the same live loop in a TTY.
-        once=False,
-        event_lines=12 if is_agent_log else min(200, requested),
-        log_lines=requested if is_agent_log else 30,
-        lines=None,
-        refresh=0.4,
-        logs=False,
-    )
-
-
-def cmd_tail(args: argparse.Namespace, runs_dir: Path) -> int:
-    """Compatibility shim for the (now deprecated) ``ai tail``.
-
-    Behavior contract:
-
-    * Default rendered output → delegates to :func:`cmd_show` so
-      operators see the same combined view they'd get from
-      ``ai show``. Prints a one-line deprecation note to stderr in TTY.
-    * ``--agent-log`` → also delegates to ``cmd_show`` (the combined
-      view already embeds the agent transcript). Notes deprecation.
-    * Scripting flags (``--raw`` / ``--from-seq`` / ``--type``) →
-      raw ``events.jsonl`` JSONL output. These flags are explicitly
-      scripting-only: they always emit JSONL, even when ``--raw``
-      isn't passed, so there is no second rendered events renderer
-      lurking on the ``ai tail`` side.
-    """
-    use_raw = bool(getattr(args, "raw", False))
-    has_seq = getattr(args, "from_seq", None) is not None
-    has_types = bool(getattr(args, "types", []))
-    is_scripting = use_raw or has_seq or has_types
-
-    if not is_scripting:
-        # Rendered/agent-log paths fold into ``ai show``. We resolve
-        # the run here only to keep the "run not found" error path
-        # firing before the deprecation hint, so an operator who typed
-        # the wrong id sees a useful error instead of redirected noise.
-        _resolve_run(runs_dir, args.run_id)
-        if sys.stderr.isatty():
-            target = "ai show"
-            if getattr(args, "agent_log", False):
-                hint = (
-                    f"note: `ai tail --agent-log` is folded into `ai show` — "
-                    f"`{target} {args.run_id}` already includes the agent "
-                    "transcript."
-                )
-            else:
-                hint = (
-                    f"note: `ai tail` is deprecated. Run "
-                    f"`{target} {args.run_id}` for the combined live view."
-                )
-            print(hint, file=sys.stderr)
-        return cmd_show(_show_args_from_tail(args), runs_dir)
-
-    # Scripting path: raw events JSONL output, no rendered view.
-    # Any of ``--raw`` / ``--from-seq`` / ``--type`` opts in. We force
-    # ``raw=True`` for the emit even when only ``--from-seq`` /
-    # ``--type`` were passed — these flags exist for jq-style
-    # pipelines and a rendered events stream is precisely the second
-    # renderer the spec told us to retire. Operators who want the
-    # rendered combined view should run ``ai show``.
-    run = _resolve_run(runs_dir, args.run_id)
-    types = set(args.types) if args.types else None
-
-    def _process(evt: dict) -> bool:
-        """Emit the event (respecting ``--type``); return True iff terminal.
-
-        Terminal check runs *before* the type filter so a ``--type`` that
-        excludes ``run_finished`` still short-circuits ``--follow`` rather
-        than spinning forever on a finished run."""
-        terminal = evt.get("type") in TERMINAL_EVENT_TYPES
-        if not types or evt.get("type") in types:
-            _emit_event(evt, raw=True)
-        return terminal
-
-    last_seq = 0
-    saw_terminal = False
-    if args.from_seq is not None:
-        last_seq = args.from_seq
-        for evt in iter_events_from_seq(run.paths.events, last_seq):
-            saw_terminal |= _process(evt)
-            last_seq = max(last_seq, int(evt.get("seq", last_seq)))
-    else:
-        initial = tail_events(run.paths.events, n=max(1, args.lines))
-        for evt in initial:
-            saw_terminal |= _process(evt)
-        last_seq = int(initial[-1]["seq"]) if initial and "seq" in initial[-1] else 0
-
-    if not args.follow or saw_terminal:
-        return EXIT_OK
-
-    # Polling follow: simple, lockless, never contends with the writer.
-    # inotify would be nicer but adds a dependency for a small optimisation.
-    try:
-        while True:
-            any_new = False
-            for evt in iter_events_from_seq(run.paths.events, last_seq):
-                any_new = True
-                last_seq = max(last_seq, int(evt.get("seq", last_seq)))
-                if _process(evt):
-                    return EXIT_OK
-            if not any_new:
-                time.sleep(0.25)
-    except KeyboardInterrupt:
-        return EXIT_OK
-
-
-def _emit_event(evt: dict, *, raw: bool = False) -> None:
-    """Emit one event line — JSON for ``--raw``, rendered otherwise."""
-    if raw:
-        sys.stdout.write(json.dumps(evt) + "\n")
-    else:
-        from .display import render_event
-
-        sys.stdout.write(render_event(evt) + "\n")
-    sys.stdout.flush()
 
 
 def _drop_mutation(
@@ -1148,7 +953,6 @@ _COMMAND_MAP = {
     "kill": cmd_kill,
     "ls": cmd_ls,
     "show": cmd_show,
-    "tail": cmd_tail,
     "send": cmd_send,
     "rewind": cmd_rewind,
     "set-prompt": cmd_set_prompt,
@@ -1167,7 +971,7 @@ _COMMAND_MAP = {
 # are intentionally excluded — they don't take a ``run_id`` argument at
 # all.
 SELECTOR_COMMANDS = frozenset({
-    "restart", "kill", "show", "tail", "send", "rewind", "set-prompt",
+    "restart", "kill", "show", "send", "rewind", "set-prompt",
     "pause", "resume", "worktree", "diff", "apply", "revert",
     "worktree-remove",
 })

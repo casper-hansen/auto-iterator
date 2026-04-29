@@ -58,19 +58,6 @@ def test_rewind_parser_happy() -> None:
     print("  test_rewind_parser_happy PASS")
 
 
-def test_tail_parser_filters() -> None:
-    p = _build_parser()
-    args = p.parse_args([
-        "tail", "20260422T085738Z-abc",
-        "--type", "inner_started", "--type", "review_finished",
-        "--follow", "--from-seq", "42",
-    ])
-    assert args.types == ["inner_started", "review_finished"]
-    assert args.follow is True
-    assert args.from_seq == 42
-    print("  test_tail_parser_filters PASS")
-
-
 def test_send_parser() -> None:
     p = _build_parser()
     args = p.parse_args(["send", "id", "Focus on X", "--wait"])
@@ -111,7 +98,6 @@ def main() -> None:
     test_run_parser_basics()
     test_run_requires_prompt()
     test_rewind_parser_happy()
-    test_tail_parser_filters()
     test_send_parser()
     test_set_prompt_parser_mutex()
     test_kill_parser_flags()

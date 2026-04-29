@@ -4,7 +4,7 @@
 Back-compat shim: the loop's semantics now live in
 ``auto_iterator.runner`` and every invocation (foreground or detached)
 creates a run-dir under ``~/.auto-iterator/runs/`` (or
-``$AUTO_ITERATOR_RUNS_DIR``) so ``ai ls`` / ``ai tail`` can observe the
+``$AUTO_ITERATOR_RUNS_DIR``) so ``ai ls`` / ``ai show`` can observe the
 run while it's in flight.
 
 For operators who prefer the detached workflow, the recommended entry
