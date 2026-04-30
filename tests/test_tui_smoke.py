@@ -144,6 +144,67 @@ async def test_pressing_enter_pushes_detail_screen():
                 assert app.screen.paths.run_id == paths.run_id
 
 
+async def test_pressing_enter_seeds_full_agent_log():
+    """The press-Enter path seeds the *entire* existing transcript.
+
+    Reviewer pin: previously the run-list pushed
+    ``RunDetailScreen(paths)`` with the default ``initial_log_lines=30``,
+    so older log lines were permanently absent from the screen even
+    though the original task asked for "the full raw logs in one
+    screen". The fix is to push with ``initial_log_lines=None`` so
+    ``_seed_initial_log`` streams the whole file before parking the
+    tailer at EOF.
+
+    We seed with 200 lines (well above the previous 30-line cap) and
+    assert that every single one is rendered into the ``RichLog``."""
+    from auto_iterator.tui import RunDetailScreen, RunListApp
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runs_dir = Path(tmp)
+        paths = _seed_run_dir(runs_dir)
+        # 200 unique lines so we can detect any line being dropped.
+        seed_lines = [f"agent line {i:04d}" for i in range(200)]
+        paths.agent_log.write_text("\n".join(seed_lines) + "\n", encoding="utf-8")
+
+        row = _make_run_row(paths.run_id)
+        app = RunListApp(runs_dir)
+        with mock.patch(
+            "auto_iterator.tui.list_runs", return_value=[row],
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause(0.05)
+                await pilot.press("enter")
+                # ``on_mount`` runs synchronously after push; a tiny
+                # pause lets the seed render before we inspect.
+                await pilot.pause(0.1)
+                assert isinstance(app.screen, RunDetailScreen)
+                # Sentinel: the screen knows it should render the full
+                # log (not a bounded tail).
+                assert app.screen.initial_log_lines is None, (
+                    "press-Enter must request the full transcript, "
+                    "not the bounded tail"
+                )
+
+                # Every seeded line landed in the RichLog. We compare
+                # rendered Strip text rather than relying on widget
+                # internals so the assertion is robust across Textual
+                # versions.
+                log_widget = app.screen._log_widget
+                assert log_widget is not None
+                rendered = "\n".join(
+                    str(line) for line in log_widget.lines
+                )
+                # First, last, and a middle line — proving the seed
+                # spans the whole file, not just a 30-line tail.
+                assert "agent line 0000" in rendered, (
+                    "the head of the log must be visible after Enter"
+                )
+                assert "agent line 0100" in rendered
+                assert "agent line 0199" in rendered, (
+                    "the tail of the log must be visible after Enter"
+                )
+
+
 async def test_send_modal_writes_guidance_file():
     """Pressing ``s`` → modal → submit → ``control/guidance.txt`` written."""
     from auto_iterator.tui import RunListApp, _PromptModal

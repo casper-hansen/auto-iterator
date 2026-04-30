@@ -10,10 +10,15 @@ Two screens, one app, polled timers, **filesystem-as-protocol**:
   none of them holds a runner pid.
 * :class:`RunDetailScreen` is what ``ai show <run_id>`` opens (when
   stdout is a TTY and ``--once`` / ``--logs`` / ``--json`` are not
-  set). Three stacked panels: the same status block as the non-TTY
-  view (re-using :func:`_status_section_lines`), a streaming events
-  panel rendered through the existing :func:`render_event`, and a
-  scrollable agent-output panel backed by :class:`LogTailer`.
+  set). Two stacked widgets: a single-line minimal status bar
+  summarizing reconciled run state (status / phase / outer-inner /
+  verdict / paused) and a scrollable agent-output panel filling the
+  rest of the screen, backed by :class:`LogTailer`. The verbose
+  status block, the prompt preview and the structured events stream
+  are intentionally absent here: pressing Enter on a run is the
+  "watch the agent work" view, and surfacing them would compete with
+  the raw transcript for screen space. Operators who need them can
+  drop back to ``ai show <run_id> --once`` or ``ai events``.
 
 Design rules baked in:
 
@@ -23,8 +28,9 @@ Design rules baked in:
   :func:`actions.signal_runner` so the same code path the CLI uses
   is exercised, no shortcut.
 * **Polling, not inotify.** Each screen owns its own ``set_interval``
-  timers (≈1 s for the run list, ≈0.5 s for status/events, ≈0.2 s for
-  the agent log). No background thread, no subscribed file watcher.
+  timers (≈1 s for the run list, ≈0.5 s for the detail status bar,
+  ≈0.2 s for the agent log). No background thread, no subscribed
+  file watcher.
 * **Lazy import.** This module is imported by :func:`cli.cmd_show`
   only on the TTY default path so plain ``ai ls`` doesn't pay the
   Textual startup cost.
@@ -57,10 +63,10 @@ from textual.widgets import (
 )
 
 from . import actions
-from .display import LogTailer, _status_section_lines, render_event
-from .events import tail_events
-from .ls import RunRow, list_runs
-from .run_dir import RunPaths
+from .display import LogTailer
+from .ls import RunRow, list_runs, reconcile_status
+from .meta import read_meta
+from .run_dir import RunPaths, read_json
 
 
 # ── Helpers shared by both screens ──────────────────────────────────────────
@@ -73,6 +79,39 @@ def _strip_ansi(text: str) -> str:
     import re
 
     return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+
+
+def _minimal_status_line(paths: RunPaths) -> str:
+    """One-line reconciled status summary for the per-run detail view.
+
+    The detail screen strips the verbose status block, prompt preview,
+    and events panel so the agent transcript fills the screen. We
+    still want a single-glance answer to "is this run alive, and how
+    far has it gotten?", so this helper folds the small subset of
+    fields an operator scans first into a compact bar:
+
+    ``<run_id> · status · phase · outer/inner · verdict: … · paused: …``
+
+    Reads ``meta.json`` and ``state.json`` directly (same source the
+    full status block uses) so the bar survives a run-dir whose
+    state is partially written. Missing fields collapse to ``—`` so
+    the bar's shape stays stable as the run progresses."""
+    meta = read_meta(paths) or {}
+    try:
+        state = read_json(paths.state)
+    except (FileNotFoundError, ValueError):
+        state = None
+    status = reconcile_status(paths, meta, state=state)
+    state = state or {}
+    phase = state.get("phase") or meta.get("status") or "—"
+    outer = int(state.get("outer", 0) or 0)
+    inner = int(state.get("inner", 0) or 0)
+    verdict = state.get("last_verdict") or "—"
+    paused = "yes" if state.get("paused") else "no"
+    return (
+        f"{paths.run_id} · {status} · {phase} · "
+        f"{outer}/{inner} · verdict: {verdict} · paused: {paused}"
+    )
 
 
 def _row_cells(row: RunRow) -> tuple[str, ...]:
@@ -371,7 +410,14 @@ class RunListScreen(Screen):
             self.notify("(no run selected)", severity="warning")
             return
         paths = RunPaths(runs_dir=self.runs_dir, run_id=sel.run_id)
-        self.app.push_screen(RunDetailScreen(paths))
+        # Pressing Enter on a row is the "watch the agent work" gesture;
+        # the operator explicitly asked for the *full* raw transcript
+        # rather than a bounded tail. ``initial_log_lines=None`` tells
+        # the detail screen to seed the panel with the whole agent log
+        # before parking the tailer at EOF, so older lines stay
+        # scrollable. The standalone ``ai show`` path still honors
+        # ``--lines`` because it instantiates the screen explicitly.
+        self.app.push_screen(RunDetailScreen(paths, initial_log_lines=None))
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Mouse-double-click / Enter on a focused DataTable row.
@@ -778,43 +824,42 @@ class _DiffViewer(ModalScreen[None]):
 
 
 class RunDetailScreen(Screen):
-    """Per-run detail view: status header + events stream + agent log.
+    """Per-run detail view: minimal status bar + full agent transcript.
 
     Layout (top → bottom):
 
-    1. **Status panel** — re-uses :func:`_status_section_lines` from
-       ``display.py`` so the rendered key/value block stays
-       byte-identical to ``ai show --once`` modulo ANSI stripping.
-       Refreshed every 0.5 s.
-    2. **Events panel** — a ``RichLog`` whose lines come from
-       :func:`render_event` (the same per-event formatter the non-TTY
-       view uses). We track the highest seen ``seq`` so newly
-       appended events stream in incrementally; we never re-paint the
-       whole log.
-    3. **Agent log panel** — a ``RichLog`` driven by
-       :class:`LogTailer`. Bytes that arrive between ticks are
-       appended; if the operator scrolls up, ``auto_scroll`` is left
-       off so they aren't yanked back to the tail. Pressing ``f``
-       toggles follow.
+    1. **Status bar** — a single line built by
+       :func:`_minimal_status_line` summarizing the reconciled run
+       state (status / phase / outer-inner / verdict / paused). It
+       refreshes every ``refresh_seconds`` so an operator parked in
+       the log still sees the run advance.
+    2. **Agent log panel** — a ``RichLog`` driven by
+       :class:`LogTailer`, expanded to fill the rest of the screen.
+       Bytes that arrive between ticks are appended; if the operator
+       scrolls up, ``auto_scroll`` is left off so they aren't yanked
+       back to the tail. Pressing ``f`` toggles follow.
 
-    The ``--refresh`` CLI flag tunes the status/events timer; the
-    agent log polls at a fixed 0.2 s because that's the rate at which
-    a chatty agent's transcript becomes worth re-rendering."""
+    The verbose status block, the prompt preview, and the structured
+    events stream that the non-TTY ``ai show`` view emits are
+    intentionally omitted: this screen exists to watch the agent's
+    raw transcript scroll by. Operators who need the structured data
+    can use ``ai show <run_id> --once`` (combined block) or
+    ``ai events <run_id>`` from a separate terminal.
+
+    The ``--refresh`` CLI flag tunes the status-bar timer; the agent
+    log polls at a fixed 0.2 s because that's the rate at which a
+    chatty agent's transcript becomes worth re-rendering."""
 
     DEFAULT_CSS = """
-    RunDetailScreen #status-panel {
-        height: auto;
-        max-height: 16;
-        border: round $primary;
+    RunDetailScreen #status-bar {
+        height: 1;
+        background: $primary;
+        color: $text;
         padding: 0 1;
     }
-    RunDetailScreen #events-panel {
-        height: 1fr;
-        border: round $secondary;
-    }
     RunDetailScreen #log-panel {
-        height: 2fr;
-        border: round $accent;
+        height: 1fr;
+        border: none;
     }
     """
 
@@ -826,7 +871,6 @@ class RunDetailScreen(Screen):
         Binding("g", "scroll_log_top", "Top"),
         Binding("G", "scroll_log_bottom", "Bottom"),
         Binding("f", "toggle_follow", "Follow"),
-        Binding("tab", "focus_next_panel", "Tab"),
     ]
 
     def __init__(
@@ -834,14 +878,20 @@ class RunDetailScreen(Screen):
         paths: RunPaths,
         *,
         refresh_seconds: float = 0.5,
-        initial_log_lines: int = 30,
+        initial_log_lines: Optional[int] = 30,
     ) -> None:
         super().__init__()
         self.paths = paths
         self.refresh_seconds = max(0.1, float(refresh_seconds))
-        self.initial_log_lines = max(1, int(initial_log_lines))
+        # ``None`` is the "seed the entire existing log" sentinel used
+        # by the run-list Enter action (the operator explicitly asked
+        # for the full raw transcript, not a bounded tail). An int
+        # caps the seed at that many trailing lines, which is what the
+        # CLI's ``ai show --lines`` path needs.
+        self.initial_log_lines: Optional[int] = (
+            None if initial_log_lines is None else max(1, int(initial_log_lines))
+        )
         self._tailer = LogTailer(paths.agent_log)
-        self._last_event_seq = 0
         # ``_follow`` reflects the *current* desired auto-scroll state;
         # it is recomputed each refresh from the widget's actual scroll
         # position so mouse-wheel / PageUp / Home scrolling correctly
@@ -853,22 +903,18 @@ class RunDetailScreen(Screen):
         self._follow = True
         self._user_forced_follow_off = False
         self._status_widget: Optional[Static] = None
-        self._events_widget: Optional[RichLog] = None
         self._log_widget: Optional[RichLog] = None
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        self._status_widget = Static("(loading status...)", id="status-panel", expand=True)
-        yield self._status_widget
-        events = RichLog(
-            id="events-panel",
-            wrap=False,
-            highlight=False,
-            markup=False,
-            auto_scroll=True,
+        # No Header/Footer here: the operator asked for a minimal
+        # "show me the logs" screen and a chrome-free layout maximizes
+        # the row budget for the transcript on a 24-row terminal.
+        # Bindings are still active globally so ``q``/``f``/``g``/``G``
+        # work without a visible footer cheatsheet.
+        self._status_widget = Static(
+            "(loading status...)", id="status-bar", expand=True, markup=False,
         )
-        self._events_widget = events
-        yield events
+        yield self._status_widget
         log = RichLog(
             id="log-panel",
             wrap=False,
@@ -878,18 +924,16 @@ class RunDetailScreen(Screen):
         )
         self._log_widget = log
         yield log
-        yield Footer()
 
     def on_mount(self) -> None:
-        # Seed the log panel with the existing tail so the operator
-        # has context when the screen opens. After the first call the
-        # ``LogTailer`` offset is at EOF, so subsequent polls only
-        # surface new bytes.
+        # Seed the log panel with the existing transcript (full file
+        # when ``initial_log_lines is None``, bounded tail otherwise)
+        # so the operator has context when the screen opens. After the
+        # first call the ``LogTailer`` offset is at EOF, so subsequent
+        # polls only surface new bytes.
         self._seed_initial_log()
         self._refresh_status()
-        self._refresh_events()
         self.set_interval(self.refresh_seconds, self._refresh_status)
-        self.set_interval(self.refresh_seconds, self._refresh_events)
         self.set_interval(0.2, self._refresh_log)
 
     # ── refresh handlers ──
@@ -898,26 +942,11 @@ class RunDetailScreen(Screen):
         if self._status_widget is None:
             return
         try:
-            lines = _status_section_lines(self.paths)
+            text = _minimal_status_line(self.paths)
         except Exception as exc:
             self._status_widget.update(f"(status unavailable: {exc})")
             return
-        text = "\n".join(_strip_ansi(line) for line in lines)
-        self._status_widget.update(text)
-
-    def _refresh_events(self) -> None:
-        if self._events_widget is None:
-            return
-        # We re-tail the events file each tick (cheap: bounded read).
-        # ``tail_events`` returns up to N most recent events; we then
-        # filter to ones we haven't already rendered using ``seq``.
-        events = tail_events(self.paths.events, n=200)
-        new = [e for e in events if int(e.get("seq") or 0) > self._last_event_seq]
-        for evt in new:
-            self._events_widget.write(_strip_ansi(render_event(evt, color=False)))
-            seq = int(evt.get("seq") or 0)
-            if seq > self._last_event_seq:
-                self._last_event_seq = seq
+        self._status_widget.update(_strip_ansi(text))
 
     def _refresh_log(self) -> None:
         if self._log_widget is None:
@@ -951,22 +980,47 @@ class RunDetailScreen(Screen):
             self._log_widget.write(line)
 
     def _seed_initial_log(self) -> None:
-        # Render a bounded tail (last N lines) so the screen opens
-        # with useful context but doesn't blast multi-MiB files into
-        # the widget synchronously. We then park the tailer's offset
-        # *directly* at EOF — calling ``read_new_lines`` to "burn"
-        # the file would be wrong for logs larger than the per-tick
-        # cap (~4 MiB), because the second tick would surface
-        # historical bytes instead of new appends.
+        # Two seeding modes share one EOF-park step at the end:
+        #
+        # * ``initial_log_lines is None`` — stream the whole agent log
+        #   into the widget, line by line. This is the "press Enter on
+        #   a run" path: the operator asked for the full raw
+        #   transcript and we honor it. We iterate the file handle
+        #   instead of ``read_text()`` so memory stays bounded by the
+        #   single longest line rather than the whole file.
+        # * ``initial_log_lines`` is an int — render only that many
+        #   trailing lines via :func:`tail_text_file`. This is the
+        #   ``ai show --lines N`` path: the operator deliberately
+        #   bounded the screen budget.
+        #
+        # In both branches we then park the tailer's offset *directly*
+        # at EOF — calling ``read_new_lines`` to "burn" historical
+        # bytes would be wrong for logs larger than the per-tick cap
+        # (~4 MiB), because the second tick would surface historical
+        # bytes instead of new appends.
         if self._log_widget is None:
             return
-        from .display import tail_text_file
 
         if self.paths.agent_log.exists():
-            for line in tail_text_file(
-                self.paths.agent_log, lines=self.initial_log_lines,
-            ):
-                self._log_widget.write(line)
+            if self.initial_log_lines is None:
+                try:
+                    with self.paths.agent_log.open(
+                        "r", encoding="utf-8", errors="replace"
+                    ) as fh:
+                        for raw in fh:
+                            self._log_widget.write(raw.rstrip("\r\n"))
+                except OSError:
+                    # File vanished mid-read (rotated / cleaned up):
+                    # fall through to the EOF park so subsequent ticks
+                    # behave as if the screen opened on an empty log.
+                    pass
+            else:
+                from .display import tail_text_file
+
+                for line in tail_text_file(
+                    self.paths.agent_log, lines=self.initial_log_lines,
+                ):
+                    self._log_widget.write(line)
         # Always advance to EOF — even if the file does not exist yet,
         # ``seek_to_end`` is a no-op that leaves the offset at 0 ready
         # for the first append.
@@ -1033,11 +1087,6 @@ class RunDetailScreen(Screen):
             severity="information",
         )
 
-    def action_focus_next_panel(self) -> None:
-        # Cycle focus across the three panels so keyboard-only
-        # operators can scroll events and agent log independently.
-        self.focus_next()
-
 
 # ── App wrappers ────────────────────────────────────────────────────────────
 
@@ -1069,7 +1118,7 @@ class RunDetailApp(App):
         paths: RunPaths,
         *,
         refresh_seconds: float = 0.5,
-        initial_log_lines: int = 30,
+        initial_log_lines: Optional[int] = 30,
     ) -> None:
         super().__init__()
         self.paths = paths
@@ -1101,9 +1150,13 @@ def run_detail_app(
     paths: RunPaths,
     *,
     refresh_seconds: float = 0.5,
-    initial_log_lines: int = 30,
+    initial_log_lines: Optional[int] = 30,
 ) -> int:
-    """Launch the per-run detail TUI. Returns a CLI exit code."""
+    """Launch the per-run detail TUI. Returns a CLI exit code.
+
+    ``initial_log_lines=None`` seeds the screen with the entire
+    existing agent log; an int caps the seed at that many trailing
+    lines."""
     app = RunDetailApp(
         paths,
         refresh_seconds=refresh_seconds,
