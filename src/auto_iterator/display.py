@@ -725,7 +725,143 @@ def state_json_text(paths: RunPaths) -> str:
     return json.dumps(obj, indent=2) + "\n"
 
 
+# ── LogTailer (incremental file reader for the TUI) ──────────────────────────
+
+
+class LogTailer:
+    """Stream new lines from a growing text file by remembering the offset.
+
+    The Textual agent-output panel polls this on every tick (~0.2 s)
+    so it must:
+
+    * Read **only the new bytes** since the last call. We track
+      ``self._offset`` and seek there on every read; an ``stat()`` is
+      cheap enough that polling at 5 Hz for a single run is invisible
+      even in ``htop``.
+    * Survive **truncation / rotation**. If ``st_size`` shrinks below
+      the cached offset, we reset to 0 so the widget rebuilds from the
+      new beginning rather than seeking past EOF.
+    * Buffer **partial trailing lines**. Agents write line-buffered
+      output, but a ``read`` between two writes can still split a line
+      down the middle of a multi-byte UTF-8 codepoint. We hold the
+      bytes after the last ``\\n`` in ``self._partial`` and prepend
+      them on the next read so a line never appears truncated.
+    * Decode with ``errors="replace"`` so a partial multi-byte read
+      can never raise — the missing bytes are recovered on the next
+      tick when the rest of the codepoint is on disk.
+
+    The class is deliberately stdlib-only: it can be unit-tested
+    without spinning up Textual, and other callers (a future ``ai
+    show --follow``, e.g.) can re-use the same primitive.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._offset = 0
+        self._partial = b""
+
+    def reset(self) -> None:
+        """Forget the cached offset and partial line.
+
+        Used both manually (re-open the file from scratch) and
+        automatically by :meth:`read_new_lines` when truncation is
+        detected. Tests rely on this being idempotent."""
+        self._offset = 0
+        self._partial = b""
+
+    def seek_to_end(self) -> int:
+        """Jump the cached offset directly to the file's current EOF.
+
+        The TUI seeds the agent-output panel with a small bounded tail
+        (the last N lines) and then wants subsequent ``read_new_lines``
+        calls to surface only future appends. Calling
+        :meth:`read_new_lines` once to "burn" the existing bytes is
+        unsafe for large logs because that method caps each read at a
+        few MiB; on a 50 MiB log the second tick would surface the
+        next chunk of *historical* bytes, not the new ones. This
+        primitive sidesteps that by ``stat``-ing the file and parking
+        the offset at EOF without reading anything.
+
+        Also clears the partial-line buffer because the bytes we'd
+        otherwise hold belong to the historical content that the
+        seed was responsible for rendering, not to a future write.
+
+        Returns the new offset (== ``st_size`` if the file exists, ``0``
+        otherwise) so callers can assert in tests."""
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            self._offset = 0
+            self._partial = b""
+            return 0
+        self._offset = size
+        self._partial = b""
+        return size
+
+    @property
+    def offset(self) -> int:
+        """Current byte offset into the file. Exposed for tests + the TUI."""
+        return self._offset
+
+    def read_new_lines(self) -> list[str]:
+        """Read everything appended since the last call, return complete lines.
+
+        Returns:
+            A list of complete lines (no trailing ``\\n``). Bytes
+            after the last newline are buffered for the next call.
+            Returns ``[]`` if the file doesn't exist, is empty, or
+            hasn't grown since the last call.
+
+        The method **does not** raise on missing or unreadable files
+        — the run-dir layout makes ``logs/agent.log`` lazy (the
+        runner only opens it when it has something to write), and we
+        don't want the polling loop to see exceptions during the
+        startup window."""
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return []
+        if size == 0:
+            # File was truncated to empty since the last read.
+            self._offset = 0
+            self._partial = b""
+            return []
+        if size < self._offset:
+            # Rotation / explicit truncation: start over.
+            self.reset()
+        if size == self._offset:
+            return []
+        try:
+            with self.path.open("rb") as f:
+                f.seek(self._offset)
+                # Bound the per-tick read to a few MiB so a runaway
+                # log can't make a single tick allocate a giant
+                # buffer. The bound is intentionally generous —
+                # 4 MiB easily covers the per-tick burst of a
+                # chatty agent — but caps the worst case.
+                chunk = f.read(min(size - self._offset, 4 * 1024 * 1024))
+        except OSError:
+            return []
+        self._offset += len(chunk)
+        if not chunk:
+            return []
+        data = self._partial + chunk
+        # Hold back any bytes after the last newline for the next call.
+        nl_idx = data.rfind(b"\n")
+        if nl_idx == -1:
+            self._partial = data
+            return []
+        complete = data[: nl_idx + 1]
+        self._partial = data[nl_idx + 1 :]
+        text = complete.decode("utf-8", errors="replace")
+        # ``splitlines`` collapses ``\r\n`` and trailing ``\n`` so we
+        # don't have to strip per-line; behaviour matches what the
+        # non-TTY ``tail_text_file`` path returns to operators.
+        return text.splitlines()
+
+
 __all__ = [
+    "LogTailer",
     "fit_section_caps",
     "render_status_view",
     "render_event",

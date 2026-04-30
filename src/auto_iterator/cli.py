@@ -28,37 +28,27 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from .backends import BACKENDS, get_backend
+from . import actions
+from .backends import BACKENDS
 from .control import parse_rewind_to
 from .feature.config import RunConfig
-from .ls import list_runs, summarize_run
-from .meta import read_meta, update_meta
+from .ls import list_runs
+from .meta import read_meta
 from .run_dir import (
-    CTL_GUIDANCE,
-    CTL_PAUSE,
-    CTL_PROMPT,
-    CTL_REWIND,
     RunPaths,
-    atomic_write_json,
-    atomic_write_text,
-    append_jsonl,
     create_run_dir,
     new_run_id,
-    now_iso,
     pid_alive,
     read_json,
     resolve_runs_dir,
-    touch,
 )
-from .runner import bootstrap_run, cfg_to_spec
+from .runner import bootstrap_run
 
 
 # ── Exit codes ────────────────────────────────────────────────────────────────
@@ -159,7 +149,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Per-user runs directory (default: $AUTO_ITERATOR_RUNS_DIR or "
              "~/.auto-iterator/runs).",
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # ``required=False`` so plain ``ai`` (no subcommand) is a legal
+    # invocation that opens the interactive run-list TUI. The
+    # dispatcher treats ``args.cmd is None`` as "open the TUI". Every
+    # existing subcommand keeps working unchanged.
+    sub = p.add_subparsers(dest="cmd", required=False)
 
     # ── run ──
     run_p = sub.add_parser("run", help="Start a new review-loop run (detached).")
@@ -348,59 +342,30 @@ def cmd_run(args: argparse.Namespace, runs_dir: Path) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USER_ERROR
 
-    run_id = new_run_id()
-    paths = create_run_dir(runs_dir, run_id)
-
     if args.foreground:
-        # Foreground path: same process runs the loop; stdout stays attached.
+        # Foreground path: same process runs the loop; stdout stays
+        # attached. Bootstrapping is in-line because the foreground
+        # caller owns the run-dir creation too — no detached fork to
+        # delegate to.
+        run_id = new_run_id()
+        paths = create_run_dir(runs_dir, run_id)
         bootstrap_run(paths, cfg, pid=os.getpid(), agent_type=args.agent_type)
         print(f"run_id: {run_id}", file=sys.stderr)
         from .runner import run_review_loop_sync
         return run_review_loop_sync(cfg, paths, agent_type=args.agent_type)
 
-    # Detached path: spawn a new-session child that re-enters this module
-    # via ``python -m auto_iterator.runner <run_dir>``. stdout/stderr go
-    # to ``logs/agent.log`` so SSH disconnect doesn't kill the runner and
-    # humans still have a raw transcript to grep.
-    atomic_write_json(paths.spec, cfg_to_spec(cfg, agent_type=args.agent_type))
-    update_meta(
-        paths,
-        run_id=run_id,
-        pid=0,  # placeholder; the child stamps its real pid on startup
-        status="running",
-        started_at=now_iso(),
-        finished_at=None,
-        workspace=cfg.workspace,
-        agent_type=args.agent_type,
-        heartbeat_at=now_iso(),
+    # Detached path: hand off to the shared spawn primitive in
+    # ``actions``. Both ``ai run`` and the TUI's ``n`` keybinding land
+    # at the same Popen site — same env, same ``start_new_session=True``,
+    # same ``stdout=agent.log``. Keep the printed run_id on stdout so
+    # scripts that ``RUN_ID=$(ai run ...)`` keep working.
+    result = actions.spawn_runner_detached(
+        runs_dir, cfg, agent_type=args.agent_type,
     )
-    append_jsonl(paths.index, {
-        "event": "run_started",
-        "timestamp": now_iso(),
-        "run_id": run_id,
-        "workspace": cfg.workspace,
-        "agent_type": args.agent_type,
-    })
-
-    log_fh = open(paths.agent_log, "ab", buffering=0)
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "auto_iterator.runner", str(paths.run_dir)],
-            stdin=subprocess.DEVNULL,
-            stdout=log_fh,
-            stderr=log_fh,
-            start_new_session=True,
-            close_fds=True,
-            cwd=cfg.workspace,
-        )
-    except OSError as exc:
-        print(f"error: failed to spawn runner: {exc}", file=sys.stderr)
+    if not result.ok:
+        print(f"error: {result.message}", file=sys.stderr)
         return EXIT_IO_ERROR
-    finally:
-        log_fh.close()
-
-    update_meta(paths, pid=proc.pid)
-    print(run_id)
+    print(result.run_id)
     return EXIT_OK
 
 
@@ -415,7 +380,6 @@ def cmd_restart(args: argparse.Namespace, runs_dir: Path) -> int:
     # Kill old runner first (best-effort) so it can't race the new one.
     _signal_runner(run, grace=args.grace, force=False)
 
-    # Spawn a fresh run-dir from the recorded spec.
     from .runner import spec_to_cfg
     try:
         cfg = spec_to_cfg(spec)
@@ -424,47 +388,15 @@ def cmd_restart(args: argparse.Namespace, runs_dir: Path) -> int:
         return EXIT_IO_ERROR
 
     agent_type = spec.get("agent_type", "review-loop")
-    new_id = new_run_id()
-    new_paths = create_run_dir(runs_dir, new_id)
-    atomic_write_json(new_paths.spec, cfg_to_spec(cfg, agent_type=agent_type))
-    update_meta(
-        new_paths,
-        run_id=new_id,
-        pid=0,
-        status="running",
-        started_at=now_iso(),
-        finished_at=None,
-        workspace=cfg.workspace,
+    result = actions.spawn_runner_detached(
+        runs_dir, cfg,
         agent_type=agent_type,
-        heartbeat_at=now_iso(),
         restarted_from=args.run_id,
     )
-    append_jsonl(new_paths.index, {
-        "event": "run_started",
-        "timestamp": now_iso(),
-        "run_id": new_id,
-        "restarted_from": args.run_id,
-        "workspace": cfg.workspace,
-        "agent_type": agent_type,
-    })
-    log_fh = open(new_paths.agent_log, "ab", buffering=0)
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "auto_iterator.runner", str(new_paths.run_dir)],
-            stdin=subprocess.DEVNULL,
-            stdout=log_fh,
-            stderr=log_fh,
-            start_new_session=True,
-            close_fds=True,
-            cwd=cfg.workspace,
-        )
-    except OSError as exc:
-        print(f"error: failed to spawn runner: {exc}", file=sys.stderr)
+    if not result.ok:
+        print(f"error: {result.message}", file=sys.stderr)
         return EXIT_IO_ERROR
-    finally:
-        log_fh.close()
-    update_meta(new_paths, pid=proc.pid)
-    print(new_id)
+    print(result.run_id)
     return EXIT_OK
 
 
@@ -476,36 +408,15 @@ def cmd_kill(args: argparse.Namespace, runs_dir: Path) -> int:
 
 
 def _signal_runner(run: _ResolvedRun, *, grace: float, force: bool) -> bool:
-    """SIGTERM → wait → SIGKILL. Returns True if we signalled a live pid."""
-    pid = run.meta.get("pid")
-    if not isinstance(pid, int) or not pid_alive(pid):
-        update_meta(run.paths, status=run.meta.get("status", "crashed"))
-        return False
+    """Thin CLI-side wrapper around :func:`actions.signal_runner`.
 
-    sig = signal.SIGKILL if force else signal.SIGTERM
-    try:
-        os.kill(pid, sig)
-    except (ProcessLookupError, PermissionError) as exc:
-        print(f"warning: could not signal pid {pid}: {exc}", file=sys.stderr)
-        return False
-
-    deadline = time.time() + max(0.0, grace)
-    while time.time() < deadline and pid_alive(pid):
-        time.sleep(0.1)
-
-    if pid_alive(pid):
-        # Escalate to SIGKILL regardless of the initial signal.
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        # Short second wait so meta lands as "killed" reliably.
-        t0 = time.time()
-        while time.time() - t0 < 2.0 and pid_alive(pid):
-            time.sleep(0.05)
-
-    update_meta(run.paths, status="killed", finished_at=now_iso())
-    return True
+    Kept as a separate function so existing tests that patch
+    ``auto_iterator.cli.pid_alive`` keep working — the actions module
+    consults ``pid_alive`` through its own import, which the same
+    monkeypatch reaches via the underlying ``run_dir.pid_alive``."""
+    return actions.signal_runner(
+        run.paths, run.meta, grace=grace, force=force,
+    )
 
 
 def cmd_ls(args: argparse.Namespace, runs_dir: Path) -> int:
@@ -564,21 +475,24 @@ def _stdout_is_tty() -> bool:
 def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
     """Render a run.
 
-    Default flow:
+    Default flow (in priority order):
 
-    * ``--json`` → one-shot raw ``state.json`` (scriptable).
-    * Non-TTY stdout, or ``--once`` / ``--logs`` → one-shot combined view.
-    * Interactive TTY → live combined view, refreshed on a timer until
-      Ctrl-C.
+    * ``--json`` → one-shot raw ``state.json`` (scriptable). Never
+      imports Textual.
+    * ``--once`` / ``--logs`` → one-shot combined text view. Never
+      imports Textual.
+    * Non-TTY stdout → same as ``--once``. Never imports Textual.
+    * Interactive TTY → opens the per-run Textual detail screen.
+
+    The TTY path lazy-imports :mod:`auto_iterator.tui` so plain
+    ``ai ls`` / ``ai show --json`` / ``ai show --once`` invocations
+    don't pay the Textual startup cost.
     """
     run = _resolve_run(runs_dir, args.run_id)
-    from .display import (
-        render_combined_view,
-        run_live_show,
-        state_json_text,
-    )
 
     if args.json:
+        # Scriptable contract: byte-identical to ``state_json_text``.
+        from .display import state_json_text
         sys.stdout.write(state_json_text(run.paths))
         return EXIT_OK
 
@@ -592,6 +506,8 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
 
     once = bool(getattr(args, "once", False) or getattr(args, "logs", False))
     if once or not _stdout_is_tty():
+        # Byte-identical to today's one-shot output. No Textual.
+        from .display import render_combined_view
         sys.stdout.write(render_combined_view(
             run.paths,
             event_lines=event_lines,
@@ -600,11 +516,13 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
         return EXIT_OK
 
     refresh = max(0.05, float(getattr(args, "refresh", 0.4) or 0.4))
-    return run_live_show(
+    # TTY default → Textual detail screen. Lazy-imported so the
+    # non-TTY paths above don't pull in Textual on every invocation.
+    from .tui import run_detail_app
+    return run_detail_app(
         run.paths,
-        event_lines=event_lines,
-        log_lines=log_lines,
         refresh_seconds=refresh,
+        initial_log_lines=log_lines,
     )
 
 
@@ -690,21 +608,7 @@ def _drop_mutation(
 def cmd_send(args: argparse.Namespace, runs_dir: Path) -> int:
     run = _resolve_run(runs_dir, args.run_id)
     text = args.text
-    line = f"{now_iso()}\t{text}\n"
-
-    def writer() -> None:
-        # O_APPEND: each write is atomic for lines under PIPE_BUF, so
-        # concurrent `ai send` calls survive together.
-        fd = os.open(
-            run.paths.control_file(CTL_GUIDANCE),
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o600,
-        )
-        try:
-            os.write(fd, line.encode("utf-8"))
-        finally:
-            os.close(fd)
-
+    writer = lambda: actions.write_guidance(run.paths, text)
     match = (lambda p: p.get("text", "") == text) if args.wait else None
     wait_for = "guidance_received" if args.wait else None
     return _drop_mutation(run, writer, wait_for_type=wait_for, match=match)
@@ -719,13 +623,11 @@ def cmd_rewind(args: argparse.Namespace, runs_dir: Path) -> int:
         return EXIT_USER_ERROR
 
     def writer() -> None:
-        atomic_write_json(
-            run.paths.control_file(CTL_REWIND),
-            {
-                "outer": intent.outer,
-                "inner": intent.inner,
-                "phase": intent.phase,
-            },
+        actions.write_rewind(
+            run.paths,
+            outer=intent.outer,
+            inner=intent.inner,
+            phase=intent.phase,
         )
 
     def match(payload: dict) -> bool:
@@ -752,7 +654,7 @@ def cmd_set_prompt(args: argparse.Namespace, runs_dir: Path) -> int:
     if not text:
         print("error: empty prompt", file=sys.stderr)
         return EXIT_USER_ERROR
-    writer = lambda: atomic_write_text(run.paths.control_file(CTL_PROMPT), text)
+    writer = lambda: actions.write_prompt(run.paths, text)
     wait_for = "prompt_updated" if args.wait else None
     return _drop_mutation(run, writer, wait_for_type=wait_for)
 
@@ -760,8 +662,7 @@ def cmd_set_prompt(args: argparse.Namespace, runs_dir: Path) -> int:
 def cmd_pause(args: argparse.Namespace, runs_dir: Path) -> int:
     run = _resolve_run(runs_dir, args.run_id)
     try:
-        run.paths.control_dir.mkdir(exist_ok=True)
-        touch(run.paths.control_file(CTL_PAUSE))
+        actions.write_pause(run.paths)
     except OSError as exc:
         print(f"error: pause failed: {exc}", file=sys.stderr)
         return EXIT_IO_ERROR
@@ -771,10 +672,7 @@ def cmd_pause(args: argparse.Namespace, runs_dir: Path) -> int:
 def cmd_resume(args: argparse.Namespace, runs_dir: Path) -> int:
     run = _resolve_run(runs_dir, args.run_id)
     try:
-        run.paths.control_file(CTL_PAUSE).unlink()
-    except FileNotFoundError:
-        # Not paused — treat as success, matches ``rm -f`` semantics.
-        pass
+        actions.clear_pause(run.paths)
     except OSError as exc:
         print(f"error: resume failed: {exc}", file=sys.stderr)
         return EXIT_IO_ERROR
@@ -1096,11 +994,32 @@ def _maybe_confirm(args: argparse.Namespace) -> bool:
     return False
 
 
+def cmd_tui(_args: argparse.Namespace, runs_dir: Path) -> int:
+    """Open the interactive Textual run-list TUI.
+
+    Routed to from the bare ``ai`` invocation (no subcommand). The
+    TUI is lazy-imported so ``ai ls`` / ``ai show --json`` etc. don't
+    pay the Textual startup cost. Returning the app's exit code makes
+    Ctrl-C from inside the TUI propagate cleanly through the shell."""
+    if not _stdout_is_tty():
+        print(
+            "error: `ai` (no subcommand) opens an interactive TUI; "
+            "stdout is not a TTY. Try `ai ls` instead.",
+            file=sys.stderr,
+        )
+        return EXIT_USER_ERROR
+    from .tui import run_list_app
+    return run_list_app(runs_dir)
+
+
 def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     runs_dir = resolve_runs_dir(args.runs_dir)
     try:
+        if args.cmd is None:
+            # Bare ``ai`` (no subcommand) → run-list TUI.
+            return cmd_tui(args, runs_dir)
         rc = _normalize_send_args(args)
         if rc is not None:
             return rc

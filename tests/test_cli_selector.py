@@ -1252,18 +1252,22 @@ def test_display_run_live_show_no_line_exceeds_columns() -> None:
 def test_main_show_keyboard_interrupt_exits_zero(capsys, monkeypatch) -> None:
     """Top-level ``ai show`` swallows KeyboardInterrupt with exit 0.
 
-    Forces the live path by pinning ``sys.stdout.isatty`` to True, then
-    monkeypatches ``run_live_show`` to raise. The wrapper in
+    Forces the TUI path by pinning ``sys.stdout.isatty`` to True, then
+    monkeypatches the lazy import so the Textual app entry point
+    raises :class:`KeyboardInterrupt`. The wrapper in
     :func:`auto_iterator.cli.main` is the last line of defence against
     a Ctrl-C in the live loop turning into a noisy traceback."""
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
-    def fake_live(*_args, **_kwargs):
+    def fake_app(*_args, **_kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(
-        "auto_iterator.display.run_live_show", fake_live, raising=True,
-    )
+    # ``cmd_show`` lazy-imports ``auto_iterator.tui`` and calls
+    # ``run_detail_app``; patch the symbol on the module so the lazy
+    # import sees our fake.
+    import auto_iterator.tui as _tui
+
+    monkeypatch.setattr(_tui, "run_detail_app", fake_app, raising=True)
     with tempfile.TemporaryDirectory() as tmp:
         paths = _seed_run(Path(tmp))
         rc = main(["--runs-dir", tmp, "show", paths.run_id])

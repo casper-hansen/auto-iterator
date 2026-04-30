@@ -7,6 +7,28 @@ name = "auto-iterator"
 version = "0.2.0"
 description = "Automated implement → review → fix loop with a filesystem-backed operator CLI"
 requires-python = ">=3.9"
+dependencies = [
+    # Textual drives the interactive ``ai`` / ``ai show`` TUI.
+    # Lower bound 0.60 = first release with the modern ``RichLog`` widget
+    # and the ``Pilot`` test harness shape we rely on. Upper bound caps
+    # the next major so a future breaking change can't silently land in
+    # ``uv lock --upgrade``. Current stable on PyPI is 8.x.
+    "textual>=0.60,<9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    # ``run_test`` returns an async generator; pytest-asyncio drives
+    # the smoke tests in ``tests/test_tui_smoke.py`` against it.
+    "pytest-asyncio>=0.21",
+]
+
+[tool.pytest.ini_options]
+# ``auto`` mode means every ``async def test_...`` is executed without
+# requiring a per-test ``@pytest.mark.asyncio`` decorator.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [project.scripts]
 ai = "auto_iterator.cli:main"
