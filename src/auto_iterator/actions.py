@@ -314,6 +314,7 @@ def _resolve_phase_default(
     explicit_backend: Optional[str],
     explicit_cmd: Optional[str],
     global_backend: str,
+    ignore_env_overrides: bool = False,
 ) -> tuple[Optional[str], Optional[str]]:
     """Resolve per-phase ``(backend_override, agent_cmd_override)``.
 
@@ -323,15 +324,25 @@ def _resolve_phase_default(
     fields. Explicit kwargs win over env vars, just like the CLI's
     ``args.x or os.environ.get(...)`` pattern.
 
+    When ``ignore_env_overrides`` is True the per-phase env vars
+    (``AGENT_{phase}_BACKEND`` / ``AGENT_{phase}_CMD``) are skipped
+    entirely so callers — typically TUI presets — get exactly the
+    layout they asked for, regardless of what the operator's shell
+    happens to export. Explicit kwargs are still honoured.
+
     Returns ``(None, None)`` for phases that resolve to the global
     backend with no custom cmd, so the resulting cfg keeps the legacy
     single-backend shape and older spec readers stay happy."""
-    phase_backend = explicit_backend or os.environ.get(
-        _PHASE_BACKEND_ENV[phase]
-    ) or None
-    phase_cmd = explicit_cmd or os.environ.get(
-        _PHASE_CMD_ENV[phase]
-    ) or None
+    if ignore_env_overrides:
+        phase_backend = explicit_backend or None
+        phase_cmd = explicit_cmd or None
+    else:
+        phase_backend = explicit_backend or os.environ.get(
+            _PHASE_BACKEND_ENV[phase]
+        ) or None
+        phase_cmd = explicit_cmd or os.environ.get(
+            _PHASE_CMD_ENV[phase]
+        ) or None
 
     if phase_backend is None and phase_cmd is None:
         return None, None
@@ -385,6 +396,7 @@ def default_run_config(
     impl_agent_cmd: Optional[str] = None,
     fix_agent_cmd: Optional[str] = None,
     reviewer_agent_cmd: Optional[str] = None,
+    ignore_env_overrides: bool = False,
 ) -> RunConfig:
     """Build a :class:`RunConfig` the way ``ai run`` would build it.
 
@@ -428,38 +440,55 @@ def default_run_config(
     so a Codex reviewer ends up with Codex's ``default_reviewer_model``
     in ``spec.json``, not Claude's.
 
+    Set ``ignore_env_overrides=True`` for opinionated callers (TUI
+    backend presets) that want exactly the layout they ask for. With
+    that flag the global ``AGENT_BACKEND`` / ``AGENT_CMD`` and the
+    per-phase ``AGENT_{IMPL,FIX,REVIEWER}_{BACKEND,CMD}`` env vars are
+    all ignored — only the explicit kwargs and the resolved backend's
+    ``default_cmd`` are consulted. The default (``False``) preserves
+    the env-driven shell-parity behaviour ``ai run`` relies on.
+
     Raises ``ValueError`` if the resolved backend isn't registered or
     the resulting config fails ``RunConfig.validate``."""
-    resolved_backend = backend or os.environ.get("AGENT_BACKEND") or "cursor"
+    if ignore_env_overrides:
+        resolved_backend = backend or "cursor"
+    else:
+        resolved_backend = backend or os.environ.get("AGENT_BACKEND") or "cursor"
     if resolved_backend not in BACKENDS:
         valid = ", ".join(sorted(BACKENDS))
         raise ValueError(
             f"unknown backend '{resolved_backend}'. valid: {valid}"
         )
     be = BACKENDS[resolved_backend]
-    resolved_agent_cmd = (
-        agent_cmd
-        or os.environ.get("AGENT_CMD")
-        or be.default_cmd
-    )
+    if ignore_env_overrides:
+        resolved_agent_cmd = agent_cmd or be.default_cmd
+    else:
+        resolved_agent_cmd = (
+            agent_cmd
+            or os.environ.get("AGENT_CMD")
+            or be.default_cmd
+        )
 
     impl_be, impl_cmd = _resolve_phase_default(
         phase="impl",
         explicit_backend=impl_backend,
         explicit_cmd=impl_agent_cmd,
         global_backend=resolved_backend,
+        ignore_env_overrides=ignore_env_overrides,
     )
     fix_be, fix_cmd = _resolve_phase_default(
         phase="fix",
         explicit_backend=fix_backend,
         explicit_cmd=fix_agent_cmd,
         global_backend=resolved_backend,
+        ignore_env_overrides=ignore_env_overrides,
     )
     reviewer_be, reviewer_cmd = _resolve_phase_default(
         phase="reviewer",
         explicit_backend=reviewer_backend,
         explicit_cmd=reviewer_agent_cmd,
         global_backend=resolved_backend,
+        ignore_env_overrides=ignore_env_overrides,
     )
 
     # Per-phase model defaults come from each phase's resolved backend

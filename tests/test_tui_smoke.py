@@ -667,30 +667,42 @@ async def test_rewind_rejects_dead_runner(monkeypatch):
             )
 
 
-async def test_new_run_respects_agent_backend_env(monkeypatch):
-    """``n`` must spawn the runner with the same backend the shell's
-    ``$AGENT_BACKEND`` would route ``ai run`` to.
+async def test_new_run_cursor_preset_pins_backend(monkeypatch):
+    """Picking the Cursor preset (key ``1``) overrides any env-var
+    backend selection so the canonical "Opus impl + GPT reviewer"
+    layout is what actually runs.
 
-    Reviewer pin: hardcoding ``backend="cursor"`` and
-    ``agent_cmd="agent"`` silently ignored ``$AGENT_BACKEND`` /
-    ``$AGENT_CMD``, so an operator whose shell ``ai run`` started
-    Codex/Claude would get a Cursor runner from pressing ``n``.
-    The TUI now goes through :func:`actions.default_run_config`,
-    which mirrors the CLI's resolution order."""
-    from auto_iterator.tui import RunListApp, _PromptModal
+    Pins the "user can see which backend will run" contract end-to-end:
+    the preset is opinionated, not a hint. The hostile env exercised
+    here is the exact one a previous review found bypassed the
+    contract — ``AGENT_CMD`` would survive into the spawned cfg and
+    ``AGENT_REVIEWER_BACKEND`` would silently turn the "Cursor" pick
+    into a mixed Cursor/Codex run. Both must be ignored now.
+    """
+    from auto_iterator.tui import (
+        RunListApp,
+        _BackendChoiceModal,
+        _PromptModal,
+    )
+    from auto_iterator.backends import BACKENDS
 
+    # Hostile env: shell points at claude-code, exports a per-phase
+    # reviewer override, and overrides the global agent_cmd. The
+    # preset must beat all of them.
     monkeypatch.setenv("AGENT_BACKEND", "claude-code")
     monkeypatch.setenv("AGENT_CMD", "claude-fake-binary")
+    monkeypatch.setenv("AGENT_REVIEWER_BACKEND", "codex")
+    monkeypatch.setenv("AGENT_REVIEWER_CMD", "codex-fake-binary")
+    monkeypatch.setenv("AGENT_IMPL_BACKEND", "codex")
+    monkeypatch.setenv("AGENT_FIX_BACKEND", "codex")
 
     captured: dict = {}
 
     def fake_spawn(runs_dir, cfg, **kwargs):
         captured["cfg"] = cfg
-        captured["runs_dir"] = runs_dir
-        captured["kwargs"] = kwargs
         from auto_iterator.actions import ActionResult
 
-        return ActionResult(ok=True, run_id="fake-run-id")
+        return ActionResult(ok=True, run_id="cursor-preset-run")
 
     with tempfile.TemporaryDirectory() as tmp:
         runs_dir = Path(tmp)
@@ -705,28 +717,175 @@ async def test_new_run_respects_agent_backend_env(monkeypatch):
                 await pilot.pause(0.05)
                 await pilot.press("n")
                 await pilot.pause(0.05)
-                # Prompt modal first.
                 assert isinstance(app.screen, _PromptModal)
                 from textual.widgets import Input
 
-                entry = app.screen.query_one("#entry", Input)
-                entry.value = "Add a feature"
+                app.screen.query_one("#entry", Input).value = "Task"
                 await pilot.press("enter")
                 await pilot.pause(0.05)
-                # Workspace modal next.
                 assert isinstance(app.screen, _PromptModal)
-                entry = app.screen.query_one("#entry", Input)
-                entry.value = str(runs_dir)
+                app.screen.query_one("#entry", Input).value = str(runs_dir)
                 await pilot.press("enter")
+                await pilot.pause(0.05)
+                assert isinstance(app.screen, _BackendChoiceModal)
+                await pilot.press("1")
                 await pilot.pause(0.05)
 
-    assert "cfg" in captured, "spawn_runner_detached must be invoked"
+    assert "cfg" in captured
     cfg = captured["cfg"]
-    assert cfg.backend == "claude-code", (
-        f"$AGENT_BACKEND must drive cfg.backend; got {cfg.backend!r}"
+    assert cfg.backend == "cursor", (
+        f"Cursor preset must pin backend=cursor regardless of env; got {cfg.backend!r}"
     )
-    assert cfg.agent_cmd == "claude-fake-binary", (
-        f"$AGENT_CMD must drive cfg.agent_cmd; got {cfg.agent_cmd!r}"
+    # Per-phase backends collapse to the global cursor backend.
+    assert cfg.backend_for("impl") == "cursor"
+    assert cfg.backend_for("fix") == "cursor"
+    assert cfg.backend_for("reviewer") == "cursor"
+    assert cfg.has_mixed_backends is False
+    # The preset must also ignore $AGENT_CMD / $AGENT_REVIEWER_CMD —
+    # otherwise the resolved binary is a lie relative to the modal.
+    cursor_default = BACKENDS["cursor"].default_cmd
+    assert cfg.agent_cmd == cursor_default, (
+        f"Cursor preset must ignore $AGENT_CMD; "
+        f"got agent_cmd={cfg.agent_cmd!r}"
+    )
+    assert cfg.impl_agent_cmd is None
+    assert cfg.fix_agent_cmd is None
+    assert cfg.reviewer_agent_cmd is None
+
+
+async def test_new_run_claude_codex_preset_picks_mixed_backends(monkeypatch):
+    """Picking the Claude+Codex preset (key ``2``) yields the canonical
+    mixed setup: Claude Code for impl/fix, Codex as the reviewer.
+
+    Equivalent to ``ai run --backend claude-code --reviewer-backend
+    codex`` from the shell — same RunConfig either way.
+
+    Exercises a hostile env that previously bypassed the preset: a
+    stale ``AGENT_IMPL_BACKEND=codex`` would silently flip the
+    implementer to Codex, ``AGENT_REVIEWER_CMD=agent`` would smuggle
+    Cursor's binary into the Codex reviewer phase, and ``AGENT_CMD``
+    would override the global Claude Code binary. The preset must pin
+    every one of those fields back to its canonical layout.
+    """
+    from auto_iterator.tui import (
+        RunListApp,
+        _BackendChoiceModal,
+        _PromptModal,
+    )
+    from auto_iterator.backends import BACKENDS
+
+    # Hostile env from the prior review: every per-phase knob is set
+    # to something the preset must ignore.
+    monkeypatch.setenv("AGENT_BACKEND", "cursor")
+    monkeypatch.setenv("AGENT_CMD", "agent")
+    monkeypatch.setenv("AGENT_IMPL_BACKEND", "codex")
+    monkeypatch.setenv("AGENT_FIX_BACKEND", "cursor")
+    monkeypatch.setenv("AGENT_REVIEWER_CMD", "agent")
+    monkeypatch.setenv("AGENT_IMPL_CMD", "agent")
+
+    captured: dict = {}
+
+    def fake_spawn(runs_dir, cfg, **kwargs):
+        captured["cfg"] = cfg
+        from auto_iterator.actions import ActionResult
+
+        return ActionResult(ok=True, run_id="mixed-preset-run")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runs_dir = Path(tmp)
+        app = RunListApp(runs_dir)
+        with mock.patch(
+            "auto_iterator.tui.list_runs", return_value=[],
+        ), mock.patch(
+            "auto_iterator.tui.actions.spawn_runner_detached",
+            side_effect=fake_spawn,
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause(0.05)
+                await pilot.press("n")
+                await pilot.pause(0.05)
+                from textual.widgets import Input
+
+                app.screen.query_one("#entry", Input).value = "Task"
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+                app.screen.query_one("#entry", Input).value = str(runs_dir)
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+                assert isinstance(app.screen, _BackendChoiceModal)
+                await pilot.press("2")
+                await pilot.pause(0.05)
+
+    assert "cfg" in captured
+    cfg = captured["cfg"]
+    assert cfg.backend == "claude-code"
+    assert cfg.backend_for("impl") == "claude-code"
+    assert cfg.backend_for("fix") == "claude-code"
+    assert cfg.backend_for("reviewer") == "codex"
+    assert cfg.has_mixed_backends is True
+    # Cmds must come from the resolved backend defaults — not env.
+    claude_default = BACKENDS["claude-code"].default_cmd
+    codex_default = BACKENDS["codex"].default_cmd
+    assert cfg.agent_cmd == claude_default, (
+        f"Claude+Codex preset must ignore $AGENT_CMD; "
+        f"got agent_cmd={cfg.agent_cmd!r}"
+    )
+    assert cfg.reviewer_agent_cmd == codex_default, (
+        f"Reviewer phase must use Codex's default_cmd, "
+        f"not $AGENT_REVIEWER_CMD; got {cfg.reviewer_agent_cmd!r}"
+    )
+    assert cfg.impl_agent_cmd is None
+    assert cfg.fix_agent_cmd is None
+
+
+async def test_new_run_backend_modal_cancel_skips_spawn(monkeypatch):
+    """Pressing Esc on the backend picker must abort the new-run flow
+    without spawning a runner. Pin the cancel-path symmetry with the
+    earlier prompt/workspace modals so a half-typed flow can be undone
+    at any step."""
+    from auto_iterator.tui import (
+        RunListApp,
+        _BackendChoiceModal,
+        _PromptModal,
+    )
+
+    spawn_calls: list = []
+
+    def fake_spawn(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        from auto_iterator.actions import ActionResult
+
+        return ActionResult(ok=True, run_id="should-not-happen")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runs_dir = Path(tmp)
+        app = RunListApp(runs_dir)
+        with mock.patch(
+            "auto_iterator.tui.list_runs", return_value=[],
+        ), mock.patch(
+            "auto_iterator.tui.actions.spawn_runner_detached",
+            side_effect=fake_spawn,
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause(0.05)
+                await pilot.press("n")
+                await pilot.pause(0.05)
+                from textual.widgets import Input
+
+                assert isinstance(app.screen, _PromptModal)
+                app.screen.query_one("#entry", Input).value = "Task"
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+                assert isinstance(app.screen, _PromptModal)
+                app.screen.query_one("#entry", Input).value = str(runs_dir)
+                await pilot.press("enter")
+                await pilot.pause(0.05)
+                assert isinstance(app.screen, _BackendChoiceModal)
+                await pilot.press("escape")
+                await pilot.pause(0.05)
+
+    assert spawn_calls == [], (
+        "Cancelling the backend picker must abort the new-run flow"
     )
 
 

@@ -255,3 +255,127 @@ def test_default_run_config_redundant_phase_backend_with_explicit_phase_cmd(
     assert cfg.reviewer_agent_cmd == "/tmp/beta-claude"
     assert cfg.agent_cmd_for("reviewer") == "/tmp/beta-claude"
     assert cfg.has_mixed_backends is True
+
+
+# ── ignore_env_overrides (TUI preset path) ─────────────────────────────────
+
+
+def test_ignore_env_overrides_pins_cursor_against_hostile_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Cursor preset case: caller asks for a single-backend Cursor
+    run with no per-phase overrides. With ``ignore_env_overrides=True``
+    a hostile shell that exports ``AGENT_CMD`` / per-phase backends /
+    per-phase cmds must not be able to leak into the resolved cfg.
+
+    Regression: the "user can see which backend will run" contract was
+    silently broken when the modal said "Cursor — Opus impl + GPT
+    reviewer" but ``AGENT_REVIEWER_BACKEND=codex`` rewrote the reviewer
+    phase to Codex behind the operator's back."""
+    monkeypatch.setenv("AGENT_BACKEND", "claude-code")
+    monkeypatch.setenv("AGENT_CMD", "claude-fake-binary")
+    monkeypatch.setenv("AGENT_REVIEWER_BACKEND", "codex")
+    monkeypatch.setenv("AGENT_REVIEWER_CMD", "codex-fake-binary")
+    monkeypatch.setenv("AGENT_IMPL_BACKEND", "codex")
+    monkeypatch.setenv("AGENT_FIX_BACKEND", "codex")
+    monkeypatch.setenv("AGENT_IMPL_CMD", "codex-fake-binary")
+    monkeypatch.setenv("AGENT_FIX_CMD", "codex-fake-binary")
+
+    cfg = actions.default_run_config(
+        task="t",
+        workspace="/tmp/ws",
+        backend="cursor",
+        ignore_env_overrides=True,
+    )
+
+    assert cfg.backend == "cursor"
+    assert cfg.agent_cmd == BACKENDS["cursor"].default_cmd
+    assert cfg.backend_for("impl") == "cursor"
+    assert cfg.backend_for("fix") == "cursor"
+    assert cfg.backend_for("reviewer") == "cursor"
+    assert cfg.impl_backend is None
+    assert cfg.fix_backend is None
+    assert cfg.reviewer_backend is None
+    assert cfg.impl_agent_cmd is None
+    assert cfg.fix_agent_cmd is None
+    assert cfg.reviewer_agent_cmd is None
+    assert cfg.has_mixed_backends is False
+    # Model fingerprints come from cursor, not the env-named backends.
+    assert cfg.impl_model == BACKENDS["cursor"].default_impl_model
+    assert cfg.reviewer_model == BACKENDS["cursor"].default_reviewer_model
+
+
+def test_ignore_env_overrides_pins_claude_codex_against_hostile_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Claude+Codex preset case: caller asks for ``backend=claude-code``
+    + ``reviewer_backend=codex`` and a hostile shell tries to flip impl
+    to Codex, fix back to Cursor, smuggle Cursor's ``agent`` binary
+    into the reviewer phase via ``AGENT_REVIEWER_CMD``, and override
+    the global cmd. With ``ignore_env_overrides=True`` the resolved
+    cfg must be the canonical mixed layout: Claude impl/fix, Codex
+    reviewer, every cmd from the resolved backend's default."""
+    monkeypatch.setenv("AGENT_BACKEND", "cursor")
+    monkeypatch.setenv("AGENT_CMD", "agent")
+    monkeypatch.setenv("AGENT_IMPL_BACKEND", "codex")
+    monkeypatch.setenv("AGENT_FIX_BACKEND", "cursor")
+    monkeypatch.setenv("AGENT_REVIEWER_CMD", "agent")
+    monkeypatch.setenv("AGENT_IMPL_CMD", "agent")
+
+    cfg = actions.default_run_config(
+        task="t",
+        workspace="/tmp/ws",
+        backend="claude-code",
+        reviewer_backend="codex",
+        ignore_env_overrides=True,
+    )
+
+    assert cfg.backend == "claude-code"
+    assert cfg.agent_cmd == BACKENDS["claude-code"].default_cmd
+    assert cfg.backend_for("impl") == "claude-code"
+    assert cfg.backend_for("fix") == "claude-code"
+    assert cfg.backend_for("reviewer") == "codex"
+    assert cfg.reviewer_agent_cmd == BACKENDS["codex"].default_cmd
+    assert cfg.impl_agent_cmd is None
+    assert cfg.fix_agent_cmd is None
+    assert cfg.has_mixed_backends is True
+    assert cfg.reviewer_model == BACKENDS["codex"].default_reviewer_model
+    assert cfg.impl_model == BACKENDS["claude-code"].default_impl_model
+
+
+def test_ignore_env_overrides_falls_back_to_cursor_with_no_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ignore_env_overrides=True`` with no ``backend=`` kwarg still falls
+    back to the hardcoded ``cursor`` default — env vars never enter
+    the picture. Pins the contract that the Shell-defaults preset is
+    the *only* path that consults ``AGENT_BACKEND``."""
+    monkeypatch.setenv("AGENT_BACKEND", "claude-code")
+    monkeypatch.setenv("AGENT_CMD", "claude-fake-binary")
+
+    cfg = actions.default_run_config(
+        task="t",
+        workspace="/tmp/ws",
+        ignore_env_overrides=True,
+    )
+
+    assert cfg.backend == "cursor"
+    assert cfg.agent_cmd == BACKENDS["cursor"].default_cmd
+
+
+def test_ignore_env_overrides_explicit_kwargs_still_win(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit per-phase kwargs are honoured even with the env-ignoring
+    flag — the flag only suppresses env lookups, not direct callers."""
+    _clear_agent_env(monkeypatch)
+    cfg = actions.default_run_config(
+        task="t",
+        workspace="/tmp/ws",
+        backend="claude-code",
+        reviewer_backend="codex",
+        reviewer_agent_cmd="/opt/bin/codex-pinned",
+        ignore_env_overrides=True,
+    )
+    assert cfg.backend_for("reviewer") == "codex"
+    assert cfg.reviewer_agent_cmd == "/opt/bin/codex-pinned"

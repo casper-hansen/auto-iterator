@@ -221,6 +221,185 @@ class _PromptModal(ModalScreen[Optional[str]]):
         self.dismiss(None)
 
 
+class _BackendChoiceModal(ModalScreen[Optional[dict]]):
+    """Backend / preset picker shown as the third step of "New run".
+
+    Shipped with two recommended layouts:
+
+    1. **Cursor — Opus impl + GPT reviewer.** Single-backend Cursor
+       run; ``cursor.py``'s defaults already give the canonical
+       Claude-Opus implementer / GPT-5.5 reviewer pairing.
+    2. **Claude Code + Codex — mixed.** Claude Code as
+       implementer/fixer, Codex as the fresh-eyes reviewer. Maps to
+       ``ai run --backend claude-code --reviewer-backend codex``.
+
+    Both presets pass ``ignore_env_overrides=True`` to
+    ``default_run_config`` so the runner gets exactly the layout the
+    operator picked: a stray ``AGENT_REVIEWER_BACKEND`` / ``AGENT_CMD``
+    in the surrounding shell cannot silently rewrite a "Cursor" pick
+    into a mixed Claude/Codex run, or vice-versa. Operators who want
+    env-driven backend resolution should use ``ai run`` from the
+    shell — the TUI's ``n`` verb is intentionally opinionated about
+    which two layouts it surfaces.
+
+    Returns the kwargs dict to forward to
+    :func:`auto_iterator.actions.default_run_config`, or ``None`` on
+    cancel. We deliberately surface only the canonical layouts here:
+    full per-phase control still lives behind the ``--{phase}-backend``
+    flags on ``ai run`` and the matching env vars; cramming six radio
+    buttons into a TUI modal would compete with argparse's ergonomics
+    rather than complement them.
+    """
+
+    DEFAULT_CSS = """
+    _BackendChoiceModal {
+        align: center middle;
+    }
+    _BackendChoiceModal > Vertical {
+        width: 90%;
+        max-width: 110;
+        height: auto;
+        padding: 1 2;
+        background: $panel;
+        border: thick $accent;
+    }
+    _BackendChoiceModal Label.title {
+        padding-bottom: 1;
+        text-style: bold;
+    }
+    _BackendChoiceModal Label.hint {
+        color: $text-muted;
+        padding-bottom: 1;
+    }
+    _BackendChoiceModal Label.preset-summary {
+        color: $text-muted;
+        padding: 0 0 1 4;
+    }
+    _BackendChoiceModal Button.preset {
+        width: 100%;
+        margin-bottom: 0;
+    }
+    _BackendChoiceModal Horizontal#actions {
+        height: auto;
+        align: right middle;
+        padding-top: 1;
+    }
+    _BackendChoiceModal Button.action {
+        margin-left: 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("1", "pick_one", "Cursor", show=False),
+        Binding("2", "pick_two", "Claude+Codex", show=False),
+    ]
+
+    # Order matters: the first preset is the recommended default and
+    # gets the primary-styled button (focused on mount so Enter starts
+    # immediately). Each entry's ``kwargs`` is forwarded verbatim to
+    # ``actions.default_run_config``.
+    #
+    # Both presets pass ``ignore_env_overrides=True`` so the layout
+    # the operator sees in the modal is exactly the layout the runner
+    # gets — even when the surrounding shell exports ``AGENT_CMD`` /
+    # ``AGENT_*_BACKEND`` / ``AGENT_*_CMD``. Without that flag a
+    # hostile env (e.g. a stale ``AGENT_REVIEWER_BACKEND=codex`` left
+    # over from a previous mixed run) would silently rewrite the
+    # Cursor preset into a mixed run, violating the "you can see
+    # which backend will run" contract.
+    PRESETS: tuple[dict, ...] = (
+        {
+            "id": "cursor",
+            "label": "1 · Cursor — Opus impl + GPT reviewer  (recommended)",
+            "summary": (
+                "All phases run through Cursor's CLI.\n"
+                "  impl/fix : claude-opus-4-7-thinking-max\n"
+                "  reviewer : gpt-5.5-extra-high"
+            ),
+            "kwargs": {
+                "backend": "cursor",
+                "ignore_env_overrides": True,
+            },
+        },
+        {
+            "id": "claude-codex",
+            "label": "2 · Claude Code + Codex — Claude impl/fix, Codex reviewer",
+            "summary": (
+                "Mixed-backend fallback when Cursor isn't available.\n"
+                "  impl/fix : claude (opus, claude-code CLI)\n"
+                "  reviewer : codex (fresh-eyes review)"
+            ),
+            "kwargs": {
+                "backend": "claude-code",
+                "reviewer_backend": "codex",
+                "ignore_env_overrides": True,
+            },
+        },
+    )
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("New run · backend", classes="title", markup=False)
+            yield Label(
+                "Pick the backend layout for this run. "
+                "Click a preset, or press 1 / 2.",
+                classes="hint",
+                markup=False,
+            )
+            for preset in self.PRESETS:
+                yield Button(
+                    preset["label"],
+                    id=f"preset-{preset['id']}",
+                    classes="preset",
+                    variant=("primary" if preset["id"] == "cursor" else "default"),
+                )
+                yield Label(
+                    preset["summary"],
+                    classes="preset-summary",
+                    markup=False,
+                )
+            with Horizontal(id="actions"):
+                yield Button(
+                    "Cancel", id="cancel", variant="default", classes="action",
+                )
+
+    def on_mount(self) -> None:
+        # Focus the recommended preset so an operator who pressed ``n``
+        # and just wants the default flow only has to hit Enter once
+        # more. Falling back silently if the lookup fails keeps the
+        # modal usable even if a future refactor renames the id.
+        try:
+            first = self.PRESETS[0]["id"]
+            self.query_one(f"#preset-{first}", Button).focus()
+        except Exception:
+            pass
+
+    def _kwargs_for(self, preset_id: str) -> Optional[dict]:
+        for preset in self.PRESETS:
+            if preset["id"] == preset_id:
+                return dict(preset["kwargs"])
+        return None
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "cancel":
+            self.dismiss(None)
+            return
+        if bid.startswith("preset-"):
+            kwargs = self._kwargs_for(bid[len("preset-"):])
+            self.dismiss(kwargs)
+
+    def action_pick_one(self) -> None:
+        self.dismiss(self._kwargs_for(self.PRESETS[0]["id"]))
+
+    def action_pick_two(self) -> None:
+        self.dismiss(self._kwargs_for(self.PRESETS[1]["id"]))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class _ConfirmModal(ModalScreen[bool]):
     """Yes/no confirmation for destructive verbs (kill, restart, revert).
 
@@ -433,28 +612,20 @@ class RunListScreen(Screen):
         self.action_open_selected()
 
     def action_new_run(self) -> None:
-        # Spawning a new run from the TUI requires a prompt + workspace
-        # at minimum. We collect the prompt in one modal and use the
-        # current cwd as the workspace; advanced configuration (model
-        # overrides, max_outer/inner) is left to ``ai run`` from the
-        # shell because cramming it into a TUI form would compete with
-        # argparse's ergonomics rather than complement them.
+        # Spawning a new run from the TUI is a three-step modal flow:
+        # prompt → workspace → backend preset. Advanced configuration
+        # (model overrides, max_outer/inner) is left to ``ai run`` from
+        # the shell because cramming it into a TUI form would compete
+        # with argparse's ergonomics rather than complement them.
         #
-        # The backend / ``agent_cmd`` resolution goes through
-        # :func:`actions.default_run_config` so a shell whose
-        # ``$AGENT_BACKEND`` selects Codex or Claude Code gets the
-        # *same* runner from pressing ``n`` here as it would from
-        # ``ai run`` — no front-end-specific divergence.
-        #
-        # Mixed-backend setups (e.g. Claude Code as implementer/fixer
-        # with Codex as a fresh-eyes reviewer) are configured the same
-        # way as ``ai run --reviewer-backend codex``: by exporting the
-        # per-phase env vars (``AGENT_REVIEWER_BACKEND``,
-        # ``AGENT_IMPL_BACKEND``, ``AGENT_FIX_BACKEND`` and matching
-        # ``..._CMD`` siblings) before launching the TUI.
-        # ``default_run_config`` reads them, so pressing ``n`` here
-        # produces the same RunConfig as ``ai run`` would in the same
-        # shell — no per-front-end divergence.
+        # The backend step is the only place this front-end edits
+        # backend selection: the picker exposes the two recommended
+        # layouts (Cursor with Opus+GPT, or Claude Code + Codex) and
+        # nothing else. Operators who want env-driven backend
+        # resolution use ``ai run`` from the shell. Either way, the
+        # final cfg is built by :func:`actions.default_run_config` so
+        # ``ai run`` and the TUI's ``n`` verb produce byte-identical
+        # ``RunConfig``s for the same inputs.
         def on_prompt(text: Optional[str]) -> None:
             if not text or not text.strip():
                 return
@@ -463,34 +634,48 @@ class RunListScreen(Screen):
                 if not ws or not ws.strip():
                     return
                 workspace = str(Path(ws).expanduser().resolve())
-                try:
-                    cfg = actions.default_run_config(
-                        task=text.strip(),
-                        workspace=workspace,
-                    )
-                except ValueError as exc:
-                    self.notify(
-                        f"start failed: {exc}", severity="error",
-                    )
-                    return
-                result = actions.spawn_runner_detached(self.runs_dir, cfg)
-                if result.ok:
-                    # Surface the mixed-backend selection in the toast
-                    # so the operator sees that the env vars took
-                    # effect — silent acceptance is too easy to miss.
-                    if cfg.has_mixed_backends:
-                        msg = (
-                            f"started run {result.run_id} "
-                            f"(impl={cfg.backend_for('impl')}, "
-                            f"fix={cfg.backend_for('fix')}, "
-                            f"reviewer={cfg.backend_for('reviewer')})"
+
+                def on_backend(choice: Optional[dict]) -> None:
+                    if choice is None:
+                        return
+                    try:
+                        cfg = actions.default_run_config(
+                            task=text.strip(),
+                            workspace=workspace,
+                            **choice,
                         )
+                    except ValueError as exc:
+                        self.notify(
+                            f"start failed: {exc}", severity="error",
+                        )
+                        return
+                    result = actions.spawn_runner_detached(self.runs_dir, cfg)
+                    if result.ok:
+                        # Surface the resolved backend layout so the
+                        # operator can confirm the picker worked —
+                        # silent acceptance is too easy to miss when
+                        # presets and env vars interact.
+                        if cfg.has_mixed_backends:
+                            msg = (
+                                f"started run {result.run_id} "
+                                f"(impl={cfg.backend_for('impl')}, "
+                                f"fix={cfg.backend_for('fix')}, "
+                                f"reviewer={cfg.backend_for('reviewer')})"
+                            )
+                        else:
+                            msg = (
+                                f"started run {result.run_id} "
+                                f"(backend={cfg.backend})"
+                            )
+                        self.notify(msg, severity="information")
+                        self.refresh_rows()
                     else:
-                        msg = f"started run {result.run_id}"
-                    self.notify(msg, severity="information")
-                    self.refresh_rows()
-                else:
-                    self.notify(f"start failed: {result.message}", severity="error")
+                        self.notify(
+                            f"start failed: {result.message}",
+                            severity="error",
+                        )
+
+                self.app.push_screen(_BackendChoiceModal(), on_backend)
 
             self.app.push_screen(
                 _PromptModal(
