@@ -445,6 +445,16 @@ class RunListScreen(Screen):
         # ``$AGENT_BACKEND`` selects Codex or Claude Code gets the
         # *same* runner from pressing ``n`` here as it would from
         # ``ai run`` — no front-end-specific divergence.
+        #
+        # Mixed-backend setups (e.g. Claude Code as implementer/fixer
+        # with Codex as a fresh-eyes reviewer) are configured the same
+        # way as ``ai run --reviewer-backend codex``: by exporting the
+        # per-phase env vars (``AGENT_REVIEWER_BACKEND``,
+        # ``AGENT_IMPL_BACKEND``, ``AGENT_FIX_BACKEND`` and matching
+        # ``..._CMD`` siblings) before launching the TUI.
+        # ``default_run_config`` reads them, so pressing ``n`` here
+        # produces the same RunConfig as ``ai run`` would in the same
+        # shell — no per-front-end divergence.
         def on_prompt(text: Optional[str]) -> None:
             if not text or not text.strip():
                 return
@@ -465,7 +475,19 @@ class RunListScreen(Screen):
                     return
                 result = actions.spawn_runner_detached(self.runs_dir, cfg)
                 if result.ok:
-                    self.notify(f"started run {result.run_id}", severity="information")
+                    # Surface the mixed-backend selection in the toast
+                    # so the operator sees that the env vars took
+                    # effect — silent acceptance is too easy to miss.
+                    if cfg.has_mixed_backends:
+                        msg = (
+                            f"started run {result.run_id} "
+                            f"(impl={cfg.backend_for('impl')}, "
+                            f"fix={cfg.backend_for('fix')}, "
+                            f"reviewer={cfg.backend_for('reviewer')})"
+                        )
+                    else:
+                        msg = f"started run {result.run_id}"
+                    self.notify(msg, severity="information")
                     self.refresh_rows()
                 else:
                     self.notify(f"start failed: {result.message}", severity="error")

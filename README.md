@@ -30,6 +30,7 @@ Useful run options:
 - `--max-outer` controls how many fresh-context review passes are allowed.
 - `--max-inner` controls how many review/fix rounds are allowed inside one outer pass.
 - `--backend`, `--agent-cmd`, `--impl-model`, `--fix-model`, and `--reviewer` choose the agent backend and models.
+- `--impl-backend`, `--fix-backend`, `--reviewer-backend` pin individual phases to a different backend — e.g. `--backend claude-code --reviewer-backend codex` runs Claude Code as the implementer/fixer with Codex as a fresh-eyes reviewer. Matching `--impl-cmd`, `--fix-cmd`, `--reviewer-cmd` override the per-phase CLI binary. The matching env vars `AGENT_IMPL_BACKEND` / `AGENT_FIX_BACKEND` / `AGENT_REVIEWER_BACKEND` (and `AGENT_*_CMD`) are honoured by both `ai run` and the bare `ai` TUI's "new run" verb so the same shell config produces the same mixed run from either entry point.
 - `--no-worktree` disables the default per-run git worktree isolation.
 
 ## The Loop

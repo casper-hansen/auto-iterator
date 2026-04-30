@@ -17,13 +17,14 @@ from .prompts import build_fix_prompt, build_review_prompt, parse_verdict
 async def run_implementation(cfg: RunConfig) -> None:
     """Run the implementation agent and log the outcome."""
     tag = f"{BOLD}[Impl]{NC}"
-    log(f"Implementing feature with {CYAN}{cfg.impl_model}{NC}", tag)
+    log(f"Implementing feature with {CYAN}{cfg.impl_model}{NC} "
+        f"({cfg.backend_for('impl')})", tag)
     log(f"Task: {cfg.task[:120]}...", tag)
     print()
 
     rc, _ = await run_agent(
         model=cfg.impl_model, prompt=cfg.task,
-        tag=tag, **cfg.agent_kw,
+        tag=tag, **cfg.agent_kw_for("impl"),
     )
     if rc == 0:
         ok("Implementation complete", tag)
@@ -46,8 +47,13 @@ def compose_review_prompt(
     dispatches ``/ultrareview`` via a markdown skill) take the extras
     directly so they can place them inside the template, *before* any
     terminal output-format instructions. The default path builds the
-    whole prompt itself."""
-    be = get_backend(cfg.backend)
+    whole prompt itself.
+
+    The lookup uses the *reviewer* phase's backend, not the global one,
+    so a mixed setup (e.g. Claude Code impl/fix + Codex reviewer) routes
+    the prompt through the reviewer CLI's template — Codex's generic
+    diff-inspection prompt rather than Claude Code's ultrareview skill."""
+    be = get_backend(cfg.backend_for("reviewer"))
     build_prompt = getattr(be, "build_review_prompt", None)
     if build_prompt is not None:
         return build_prompt(task, history, guidance=guidance)
@@ -68,7 +74,8 @@ async def run_review(
     ``task`` and ``guidance`` are the runtime-mutable values sourced from
     ``RunState`` — the runner passes them through so operator intents
     dropped between boundaries take effect on the very next review."""
-    log(f"Review — {CYAN}{cfg.reviewer_model}{NC}", tag)
+    log(f"Review — {CYAN}{cfg.reviewer_model}{NC} "
+        f"({cfg.backend_for('reviewer')})", tag)
 
     prompt = compose_review_prompt(
         cfg,
@@ -80,7 +87,7 @@ async def run_review(
     rc, review_text = await run_agent(
         model=cfg.reviewer_model,
         prompt=prompt,
-        tag=tag, **cfg.agent_kw,
+        tag=tag, **cfg.agent_kw_for("reviewer"),
     )
     history.append({"role": "reviewer", "content": review_text})
 
@@ -112,18 +119,19 @@ async def run_fix(
     to carry the full picture: the *task* the implementation is aiming
     at, the latest reviewer feedback (the last entry in *history*), and
     the prior rounds so the agent knows what's already been tried.
-    ``task`` is sourced from ``RunState.prompt`` by the runner and
+    ``task`` is sourced from     ``RunState.prompt`` by the runner and
     threaded through here — same pattern as :func:`run_review` — so any
     runtime ``ai set-prompt`` edit takes effect on the very next fix.
 
     Returns ``(rc, fix_text)`` so the runner can emit a ``fix_finished``
     event carrying the real exit code instead of guessing."""
-    log(f"Fixing issues — {CYAN}{cfg.fix_model}{NC}", tag)
+    log(f"Fixing issues — {CYAN}{cfg.fix_model}{NC} "
+        f"({cfg.backend_for('fix')})", tag)
 
     rc, fix_text = await run_agent(
         model=cfg.fix_model,
         prompt=build_fix_prompt(task, history),
-        tag=tag, **cfg.agent_kw,
+        tag=tag, **cfg.agent_kw_for("fix"),
     )
     history.append({"role": "fixer", "content": fix_text})
 

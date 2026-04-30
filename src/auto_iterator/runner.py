@@ -72,7 +72,11 @@ def cfg_to_spec(cfg: RunConfig, *, agent_type: str = "review-loop") -> dict:
 
 
 def spec_to_cfg(spec: dict) -> RunConfig:
-    """Reverse of :func:`cfg_to_spec`; tolerant of missing optional fields."""
+    """Reverse of :func:`cfg_to_spec`; tolerant of missing optional fields.
+
+    Per-phase backend overrides default to ``None`` when missing so
+    older spec.json files (written before mixed backends were a
+    feature) restart cleanly under the global backend."""
     kwargs = {
         "task": spec["task"],
         "impl_model": spec["impl_model"],
@@ -87,6 +91,12 @@ def spec_to_cfg(spec: dict) -> RunConfig:
         "backend": spec.get("backend", "cursor"),
         "use_worktree": bool(spec.get("use_worktree", True)),
         "worktree_path": spec.get("worktree_path"),
+        "impl_backend": spec.get("impl_backend"),
+        "fix_backend": spec.get("fix_backend"),
+        "reviewer_backend": spec.get("reviewer_backend"),
+        "impl_agent_cmd": spec.get("impl_agent_cmd"),
+        "fix_agent_cmd": spec.get("fix_agent_cmd"),
+        "reviewer_agent_cmd": spec.get("reviewer_agent_cmd"),
     }
     return RunConfig(**kwargs)
 
@@ -303,6 +313,19 @@ class ReviewLoopRunner:
 
     async def run(self) -> int:
         self.heartbeat.start()
+        # Per-phase backend/cmd are folded into the start event whenever
+        # they diverge from the global backend so observers (and the
+        # event-tape replay tools) can see immediately that this is a
+        # mixed-backend run without having to read spec.json.
+        run_started_extras: dict[str, object] = {}
+        if self.cfg.has_mixed_backends:
+            for phase in ("impl", "fix", "reviewer"):
+                run_started_extras[f"{phase}_backend"] = (
+                    self.cfg.backend_for(phase)
+                )
+                run_started_extras[f"{phase}_agent_cmd"] = (
+                    self.cfg.agent_cmd_for(phase)
+                )
         self.log.emit(
             "run_started",
             run_id=self.paths.run_id,
@@ -311,6 +334,7 @@ class ReviewLoopRunner:
             agent_cmd=self.cfg.agent_cmd,
             agent_type=self.agent_type,
             prompt_preview=(self.cfg.task or "")[:200],
+            **run_started_extras,
         )
         banner("Review Loop", self.cfg.banner_items())
 

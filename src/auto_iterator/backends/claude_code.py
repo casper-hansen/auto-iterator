@@ -191,9 +191,13 @@ class ClaudeCodeBackend:
         self,
         agent_cmd: str,
         model: str,
+        prompt: str,  # noqa: ARG002 - kept for backend API parity with codex
         workspace: str,
         extra_flags: list[str],
     ) -> list[str]:
+        # Claude Code's ``--continue`` resumes the prior session, so the
+        # original task ``prompt`` isn't needed in the command line — the
+        # CLI walks its own session log to recover state.
         cmd = self._base_cmd(agent_cmd, model)
         cmd.append("--continue")
         cmd.extend(extra_flags)

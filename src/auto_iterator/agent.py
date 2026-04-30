@@ -260,7 +260,13 @@ async def run_agent(
         if attempt == 0:
             cmd = be.build_initial_cmd(agent_cmd, model, prompt, workspace, extra_flags)
         else:
-            cmd = be.build_continue_cmd(agent_cmd, model, workspace, extra_flags)
+            # ``prompt`` is threaded through so backends that can't reliably
+            # use a CLI-side ``--continue`` (notably the codex backend, whose
+            # ``exec resume`` subcommand has version-dependent flag-parsing
+            # quirks) can fall back to re-running with the original task.
+            cmd = be.build_continue_cmd(
+                agent_cmd, model, prompt, workspace, extra_flags,
+            )
 
         outcome = await _run_once(cmd, tag, be, cwd=workspace)
         last_rc = outcome.rc

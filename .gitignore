@@ -1,9 +1,14 @@
 # Experiment loop logs
 logs/
-prompts/
+# ``prompts`` and ``__pycache__`` are written without a trailing slash so
+# symlinked variants (auto-iterator worktrees often link to a shared
+# parent's prompts/__pycache__ to avoid duplicating them) are ignored
+# too. Trailing slashes only match real directories, which makes the
+# patterns silently leak symlinks into ``git status``.
+prompts
 
 # Byte-compiled / optimized / DLL files
-__pycache__/
+__pycache__
 *.py[codz]
 *$py.class
 

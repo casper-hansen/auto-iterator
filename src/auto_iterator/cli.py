@@ -106,18 +106,140 @@ def load_text_arg(
     return (inline or "").strip()
 
 
+def _validate_backend(name: str, *, label: str = "backend") -> str:
+    """Reject an unknown backend name with a clean error.
+
+    Used both for the global ``--backend`` and the per-phase
+    ``--{impl,fix,reviewer}-backend`` overrides so error messages
+    consistently name the offending flag (``label``)."""
+    if name not in BACKENDS:
+        valid = ", ".join(sorted(BACKENDS))
+        raise ValueError(f"unknown {label} '{name}'. valid: {valid}")
+    return name
+
+
+def _resolve_phase(
+    *,
+    phase: str,
+    args: argparse.Namespace,
+    global_backend: str,
+) -> tuple[str | None, str | None]:
+    """Resolve per-phase ``(backend_override, agent_cmd_override)``.
+
+    A phase pinned to a different backend defaults its CLI binary to
+    that backend's ``default_cmd`` so spec.json is a complete snapshot
+    — operators don't have to remember to also pass
+    ``--reviewer-cmd codex`` when they pass ``--reviewer-backend codex``.
+
+    Resolution order matches the global ``--backend`` flag: explicit
+    CLI flag → matching env var (``AGENT_{IMPL,FIX,REVIEWER}_BACKEND``
+    / ``..._CMD``) → ``None``. Reading env vars here keeps
+    ``_make_cfg_from_args`` and :func:`auto_iterator.actions.default_run_config`
+    (used by the TUI's ``n`` verb) in lockstep, so an operator who
+    exports ``AGENT_REVIEWER_BACKEND=codex`` gets the mixed Claude/Codex
+    setup from either entry point.
+
+    Returns ``(None, None)`` for phases left at the global backend so
+    the persisted config keeps the legacy single-backend shape and
+    older spec readers stay happy."""
+    phase_backend = getattr(args, f"{phase}_backend", None) or os.environ.get(
+        f"AGENT_{phase.upper()}_BACKEND"
+    ) or None
+    phase_cmd = getattr(args, f"{phase}_agent_cmd", None) or os.environ.get(
+        f"AGENT_{phase.upper()}_CMD"
+    ) or None
+
+    if phase_backend is None and phase_cmd is None:
+        return None, None
+
+    if phase_backend is not None:
+        _validate_backend(phase_backend, label=f"--{phase}-backend")
+
+    # An explicit cmd without a backend is allowed (operator wants the
+    # same backend with a different binary path); the global backend
+    # then governs the stream-json adapter.
+    resolved_backend = phase_backend or global_backend
+
+    # Normalize: a phase pinned to the same backend as the global one
+    # is indistinguishable from "no override" — keep the cfg in single-
+    # backend shape so legacy spec readers stay happy.
+    out_backend = (
+        resolved_backend if resolved_backend != global_backend else None
+    )
+
+    # Only fall back to the per-phase backend's ``default_cmd`` when the
+    # phase actually diverges from the global backend. Otherwise an
+    # explicit-but-redundant ``--reviewer-backend claude-code`` would
+    # silently bypass a custom global ``--agent-cmd /tmp/custom-claude``
+    # by overwriting the inherited cmd with the backend default.
+    if phase_cmd is not None:
+        resolved_cmd = phase_cmd
+    elif out_backend is not None:
+        resolved_cmd = BACKENDS[out_backend].default_cmd
+    else:
+        resolved_cmd = None
+
+    return out_backend, resolved_cmd
+
+
+def _phase_default_model(
+    *,
+    phase: str,
+    explicit: str | None,
+    phase_backend: str | None,
+    global_backend_obj,
+) -> str:
+    """Pick the right model default for a phase.
+
+    When ``--impl-backend claude-code`` is set without ``--impl-model``,
+    the implementation model should default to Claude Code's
+    ``default_impl_model`` — not the global backend's. This mirrors the
+    pre-mixed-backend behaviour where the resolved backend's model
+    fingerprints landed in ``spec.json`` automatically."""
+    if explicit:
+        return explicit
+    be = BACKENDS[phase_backend] if phase_backend else global_backend_obj
+    attr = f"default_{phase}_model"
+    return getattr(be, attr)
+
+
 def _make_cfg_from_args(args: argparse.Namespace) -> RunConfig:
     """Translate the ``ai run`` namespace into a typed :class:`RunConfig`."""
-    backend = args.backend or os.environ.get("AGENT_BACKEND", "cursor")
-    if backend not in BACKENDS:
-        valid = ", ".join(sorted(BACKENDS))
-        raise ValueError(f"unknown backend '{backend}'. valid: {valid}")
+    backend = _validate_backend(
+        args.backend or os.environ.get("AGENT_BACKEND", "cursor")
+    )
     be = BACKENDS[backend]
+
+    impl_backend, impl_cmd = _resolve_phase(
+        phase="impl", args=args, global_backend=backend,
+    )
+    fix_backend, fix_cmd = _resolve_phase(
+        phase="fix", args=args, global_backend=backend,
+    )
+    reviewer_backend, reviewer_cmd = _resolve_phase(
+        phase="reviewer", args=args, global_backend=backend,
+    )
+
     cfg = RunConfig(
         task=load_text_arg(args.prompt, args.prompt_file, "prompt"),
-        impl_model=args.impl_model or be.default_impl_model,
-        fix_model=args.fix_model or be.default_fix_model,
-        reviewer_model=args.reviewer_model or be.default_reviewer_model,
+        impl_model=_phase_default_model(
+            phase="impl",
+            explicit=args.impl_model,
+            phase_backend=impl_backend,
+            global_backend_obj=be,
+        ),
+        fix_model=_phase_default_model(
+            phase="fix",
+            explicit=args.fix_model,
+            phase_backend=fix_backend,
+            global_backend_obj=be,
+        ),
+        reviewer_model=_phase_default_model(
+            phase="reviewer",
+            explicit=args.reviewer_model,
+            phase_backend=reviewer_backend,
+            global_backend_obj=be,
+        ),
         max_outer=args.max_outer,
         max_inner=args.max_inner,
         workspace=str(Path(args.workspace).expanduser().resolve()),
@@ -126,6 +248,12 @@ def _make_cfg_from_args(args: argparse.Namespace) -> RunConfig:
         agent_cmd=args.agent_cmd or os.environ.get("AGENT_CMD", be.default_cmd),
         backend=backend,
         use_worktree=not getattr(args, "no_worktree", False),
+        impl_backend=impl_backend,
+        fix_backend=fix_backend,
+        reviewer_backend=reviewer_backend,
+        impl_agent_cmd=impl_cmd,
+        fix_agent_cmd=fix_cmd,
+        reviewer_agent_cmd=reviewer_cmd,
     )
     err = cfg.validate()
     if err:
@@ -174,6 +302,31 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Override $AGENT_BACKEND (cursor/claude-code/codex).")
     run_p.add_argument("--agent-cmd", default=None,
                        help="Override the backend's default CLI binary name.")
+    # Per-phase backend overrides — let an operator mix CLIs across the
+    # loop. The canonical use case is "Claude Code as implementer/fixer
+    # with Codex as a fresh-eyes reviewer": pass ``--reviewer-backend
+    # codex`` and the reviewer runs through Codex while impl/fix stay
+    # on the global ``--backend`` (e.g. ``--backend claude-code``). When
+    # a per-phase backend is set without a matching ``--…-cmd``, the
+    # binary defaults to that backend's ``default_cmd``.
+    run_p.add_argument("--impl-backend", default=None,
+                       help="Pin the implementation phase to a specific backend "
+                            "(cursor/claude-code/codex). Falls back to --backend.")
+    run_p.add_argument("--fix-backend", default=None,
+                       help="Pin the fix phase to a specific backend. "
+                            "Falls back to --backend.")
+    run_p.add_argument("--reviewer-backend", default=None,
+                       help="Pin the reviewer phase to a specific backend. "
+                            "Falls back to --backend.")
+    run_p.add_argument("--impl-cmd", default=None, dest="impl_agent_cmd",
+                       help="Override the CLI binary for the implementation "
+                            "phase. Defaults to the impl backend's default_cmd.")
+    run_p.add_argument("--fix-cmd", default=None, dest="fix_agent_cmd",
+                       help="Override the CLI binary for the fix phase. "
+                            "Defaults to the fix backend's default_cmd.")
+    run_p.add_argument("--reviewer-cmd", default=None, dest="reviewer_agent_cmd",
+                       help="Override the CLI binary for the reviewer phase. "
+                            "Defaults to the reviewer backend's default_cmd.")
     run_p.add_argument("--foreground", action="store_true",
                        help="Run in the foreground (don't detach). Useful for "
                             "debugging and for legacy review-loop.py parity.")

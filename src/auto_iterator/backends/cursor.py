@@ -50,9 +50,14 @@ class CursorBackend:
         self,
         agent_cmd: str,
         model: str,
+        prompt: str,  # noqa: ARG002 - kept for backend API parity with codex
         workspace: str,
         extra_flags: list[str],
     ) -> list[str]:
+        # Cursor's ``--continue`` resumes the prior session in-place, so
+        # the original task ``prompt`` is unused here — we hand the agent
+        # a generic "pick up where you left off" hint and let the session
+        # state on disk drive the actual continuation.
         cmd = [
             agent_cmd, "-p",
             "--output-format", "stream-json",

@@ -289,6 +289,85 @@ def spawn_runner_detached(
 # ── Default-config builder for env-driven callers ──────────────────────────
 
 
+# ── Per-phase env-var names ─────────────────────────────────────────────────
+# The TUI's "new run" verb has no argparse namespace to read flags from,
+# so the only way it can spawn a *mixed-backend* run (e.g. Claude Code
+# as implementer/fixer with Codex as a fresh-eyes reviewer) is via the
+# environment. These mirror the CLI's ``--{phase}-backend`` /
+# ``--{phase}-cmd`` flags one-for-one so an operator's shell config
+# produces the same RunConfig from ``ai run`` and from pressing ``n``.
+_PHASE_BACKEND_ENV = {
+    "impl": "AGENT_IMPL_BACKEND",
+    "fix": "AGENT_FIX_BACKEND",
+    "reviewer": "AGENT_REVIEWER_BACKEND",
+}
+_PHASE_CMD_ENV = {
+    "impl": "AGENT_IMPL_CMD",
+    "fix": "AGENT_FIX_CMD",
+    "reviewer": "AGENT_REVIEWER_CMD",
+}
+
+
+def _resolve_phase_default(
+    *,
+    phase: str,
+    explicit_backend: Optional[str],
+    explicit_cmd: Optional[str],
+    global_backend: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve per-phase ``(backend_override, agent_cmd_override)``.
+
+    Mirrors :func:`auto_iterator.cli._resolve_phase` so the env-driven
+    path (``default_run_config``) and the argparse-driven path
+    (``_make_cfg_from_args``) end up with byte-identical ``RunConfig``
+    fields. Explicit kwargs win over env vars, just like the CLI's
+    ``args.x or os.environ.get(...)`` pattern.
+
+    Returns ``(None, None)`` for phases that resolve to the global
+    backend with no custom cmd, so the resulting cfg keeps the legacy
+    single-backend shape and older spec readers stay happy."""
+    phase_backend = explicit_backend or os.environ.get(
+        _PHASE_BACKEND_ENV[phase]
+    ) or None
+    phase_cmd = explicit_cmd or os.environ.get(
+        _PHASE_CMD_ENV[phase]
+    ) or None
+
+    if phase_backend is None and phase_cmd is None:
+        return None, None
+
+    if phase_backend is not None and phase_backend not in BACKENDS:
+        valid = ", ".join(sorted(BACKENDS))
+        raise ValueError(
+            f"unknown {phase}-backend '{phase_backend}'. valid: {valid}"
+        )
+
+    # An explicit cmd without a backend is allowed (operator wants the
+    # same backend with a different binary path); the global backend
+    # then governs the stream-json adapter.
+    resolved_backend = phase_backend or global_backend
+
+    # Normalize first: collapse a phase pinned to the global backend
+    # back to the legacy single-backend shape.
+    out_backend = (
+        resolved_backend if resolved_backend != global_backend else None
+    )
+
+    # Only fall back to the per-phase backend's ``default_cmd`` when the
+    # phase actually diverges from the global backend. Otherwise a
+    # redundant ``AGENT_REVIEWER_BACKEND=claude-code`` (matching the
+    # global) would silently overwrite the inherited cmd with the
+    # backend default and bypass a custom global ``AGENT_CMD``.
+    if phase_cmd is not None:
+        resolved_cmd = phase_cmd
+    elif out_backend is not None:
+        resolved_cmd = BACKENDS[out_backend].default_cmd
+    else:
+        resolved_cmd = None
+
+    return out_backend, resolved_cmd
+
+
 def default_run_config(
     *,
     task: str,
@@ -300,6 +379,12 @@ def default_run_config(
     skip_impl: bool = False,
     extra_flags: tuple[str, ...] = (),
     use_worktree: bool = True,
+    impl_backend: Optional[str] = None,
+    fix_backend: Optional[str] = None,
+    reviewer_backend: Optional[str] = None,
+    impl_agent_cmd: Optional[str] = None,
+    fix_agent_cmd: Optional[str] = None,
+    reviewer_agent_cmd: Optional[str] = None,
 ) -> RunConfig:
     """Build a :class:`RunConfig` the way ``ai run`` would build it.
 
@@ -322,6 +407,27 @@ def default_run_config(
       whose shell points at Codex doesn't accidentally get Cursor's
       model fingerprints written into ``spec.json``.
 
+    Per-phase backends — for the canonical "Claude Code impl/fix +
+    Codex reviewer" mix — can be selected three ways, each beating
+    the next:
+
+    1. Explicit kwargs (``impl_backend=`` / ``reviewer_backend=`` /
+       …) — used by callers that already know the desired layout.
+    2. Per-phase env vars: ``AGENT_IMPL_BACKEND``, ``AGENT_FIX_BACKEND``,
+       ``AGENT_REVIEWER_BACKEND`` (and matching ``..._CMD`` siblings).
+       This is how the TUI's ``n`` verb picks up a mixed setup an
+       operator configured in their shell.
+    3. Falls back to the global backend / ``agent_cmd`` for any phase
+       that's still unset.
+
+    When a per-phase backend is set without a matching cmd, the binary
+    defaults to that backend's ``default_cmd`` — same rule as
+    ``--reviewer-backend codex`` on the CLI.
+
+    Per-phase model fingerprints follow the resolved per-phase backend
+    so a Codex reviewer ends up with Codex's ``default_reviewer_model``
+    in ``spec.json``, not Claude's.
+
     Raises ``ValueError`` if the resolved backend isn't registered or
     the resulting config fails ``RunConfig.validate``."""
     resolved_backend = backend or os.environ.get("AGENT_BACKEND") or "cursor"
@@ -336,11 +442,37 @@ def default_run_config(
         or os.environ.get("AGENT_CMD")
         or be.default_cmd
     )
+
+    impl_be, impl_cmd = _resolve_phase_default(
+        phase="impl",
+        explicit_backend=impl_backend,
+        explicit_cmd=impl_agent_cmd,
+        global_backend=resolved_backend,
+    )
+    fix_be, fix_cmd = _resolve_phase_default(
+        phase="fix",
+        explicit_backend=fix_backend,
+        explicit_cmd=fix_agent_cmd,
+        global_backend=resolved_backend,
+    )
+    reviewer_be, reviewer_cmd = _resolve_phase_default(
+        phase="reviewer",
+        explicit_backend=reviewer_backend,
+        explicit_cmd=reviewer_agent_cmd,
+        global_backend=resolved_backend,
+    )
+
+    # Per-phase model defaults come from each phase's resolved backend
+    # — same rule as the CLI's ``_phase_default_model`` helper.
+    impl_model_be = BACKENDS[impl_be] if impl_be else be
+    fix_model_be = BACKENDS[fix_be] if fix_be else be
+    reviewer_model_be = BACKENDS[reviewer_be] if reviewer_be else be
+
     cfg = RunConfig(
         task=task,
-        impl_model=be.default_impl_model,
-        fix_model=be.default_fix_model,
-        reviewer_model=be.default_reviewer_model,
+        impl_model=impl_model_be.default_impl_model,
+        fix_model=fix_model_be.default_fix_model,
+        reviewer_model=reviewer_model_be.default_reviewer_model,
         max_outer=max_outer,
         max_inner=max_inner,
         workspace=workspace,
@@ -349,6 +481,12 @@ def default_run_config(
         agent_cmd=resolved_agent_cmd,
         backend=resolved_backend,
         use_worktree=use_worktree,
+        impl_backend=impl_be,
+        fix_backend=fix_be,
+        reviewer_backend=reviewer_be,
+        impl_agent_cmd=impl_cmd,
+        fix_agent_cmd=fix_cmd,
+        reviewer_agent_cmd=reviewer_cmd,
     )
     err = cfg.validate()
     if err:
