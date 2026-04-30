@@ -915,9 +915,20 @@ class RunDetailScreen(Screen):
             "(loading status...)", id="status-bar", expand=True, markup=False,
         )
         yield self._status_widget
+        # ``wrap=True`` so a long agent line (a 500-char tool-call
+        # payload, a wide diff hunk, a stack trace with embedded paths)
+        # folds onto the next visible row instead of being clipped at
+        # the terminal's right edge. Without wrapping, operators on a
+        # narrow terminal see truncated content with no horizontal
+        # scroll affordance — they'd have to widen the window or drop
+        # to ``ai show <run_id> --logs`` to read the rest. The detail
+        # screen exists to *watch the agent work*, so readability of
+        # the raw transcript trumps the per-line one-row budget that
+        # the non-TTY ``ai show`` view (``_truncate_visible``) cares
+        # about.
         log = RichLog(
             id="log-panel",
-            wrap=False,
+            wrap=True,
             highlight=False,
             markup=False,
             auto_scroll=True,

@@ -205,6 +205,43 @@ async def test_pressing_enter_seeds_full_agent_log():
                 )
 
 
+async def test_run_detail_log_panel_wraps_long_lines():
+    """``RunDetailScreen``'s agent-output panel must wrap long lines.
+
+    Reviewer pin: the ``RichLog`` widget was instantiated with
+    ``wrap=False``, so a single long agent line (e.g. a 500-character
+    tool-call payload, a wide diff hunk) was clipped at the terminal's
+    right edge with no horizontal-scroll affordance. The detail screen
+    is the "watch the agent work" view, so readability of the raw
+    transcript trumps the per-line one-row budget the non-TTY
+    ``ai show`` view (``_truncate_visible``) cares about.
+
+    We assert the widget property directly because it's the only
+    public knob that controls wrapping; rendering inspection would
+    couple to Textual's internal Strip layout."""
+    from textual.widgets import RichLog
+
+    from auto_iterator.tui import RunDetailApp
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run_dir(Path(tmp))
+        # A line wider than any sane terminal so the wrap is visibly
+        # meaningful — not just a 0/1 toggle on the widget.
+        paths.agent_log.write_text(
+            ("x" * 500) + "\n", encoding="utf-8",
+        )
+
+        app = RunDetailApp(paths, refresh_seconds=0.1, initial_log_lines=5)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            log_widget = app.screen.query_one("#log-panel", RichLog)
+            assert log_widget.wrap is True, (
+                "the agent-output panel must wrap long lines so "
+                "operators on narrow terminals can read the full "
+                "transcript without horizontal clipping"
+            )
+
+
 async def test_send_modal_writes_guidance_file():
     """Pressing ``s`` → modal → submit → ``control/guidance.txt`` written."""
     from auto_iterator.tui import RunListApp, _PromptModal
