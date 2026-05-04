@@ -50,6 +50,7 @@ from typing import Optional
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.coordinate import Coordinate
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
@@ -63,10 +64,30 @@ from textual.widgets import (
 )
 
 from . import actions
-from .display import LogTailer
+from .display import LogTailer, tail_text_file
 from .ls import RunRow, list_runs, reconcile_status
 from .meta import read_meta
 from .run_dir import RunPaths, read_json
+
+
+# Upper bound on how many lines of the existing agent transcript the
+# detail screen will materialise into the ``RichLog`` widget on open.
+#
+# The widget keeps every appended line as a pre-wrapped ``Strip`` in
+# memory and re-renders the visible region on every scroll/refresh,
+# so an unbounded buffer turns into the dominant scrolling cost over
+# a high-latency SSH link: a chatty agent run can produce a multi-MiB
+# transcript with tens of thousands of lines, and Textual's frame
+# diff for a viewport over that many strips is large enough to lag
+# noticeably even on a ~100 ms VPS round-trip.
+#
+# Capping at 10 000 lines keeps the steady-state widget cheap (more
+# than a typical operator scrolls back) while still being well above
+# the 200-line ``test_pressing_enter_seeds_full_agent_log`` floor and
+# any real "see what happened recently" need. Live appends past the
+# cap continue to land via :class:`textual.widgets.RichLog`'s built-in
+# ``max_lines`` ring-buffer.
+_FULL_LOG_SEED_CAP = 10_000
 
 
 # ── Helpers shared by both screens ──────────────────────────────────────────
@@ -506,6 +527,21 @@ class RunListScreen(Screen):
         self.runs_dir = runs_dir
         self._table: Optional[DataTable] = None
         self._rows_by_key: dict[str, RunRow] = {}
+        # Last cell-tuple we pushed into each row, indexed by run_id.
+        # The 1 Hz ``refresh_rows`` poll uses this to skip the table
+        # rebuild whenever the set + order of runs hasn't changed —
+        # only the cells that actually differ get re-painted via
+        # ``update_cell_at``. The pre-existing ``clear`` +
+        # ``add_row``-per-run path was visibly costly to the operator
+        # over a high-latency SSH link because every tick repainted
+        # the entire table, even when nothing on disk had changed.
+        self._row_cells_by_key: dict[str, tuple[str, ...]] = {}
+        # Insertion order of run_ids in the DataTable, mirrored from
+        # ``list_runs`` (started_at desc). Compared against the fresh
+        # ordering to decide whether a structural rebuild (rows
+        # added/removed/reordered) is needed or whether per-cell
+        # diffing suffices.
+        self._row_order: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -529,11 +565,26 @@ class RunListScreen(Screen):
     def refresh_rows(self) -> None:
         """Re-read ``list_runs`` and reconcile the DataTable diff.
 
-        We deliberately re-render every cell rather than tracking
-        only changed rows: ``list_runs`` is already stable order
-        (by ``started_at`` desc), and a full repaint of a few dozen
-        rows is invisibly fast. Tracking deltas would just add bugs
-        without saving anything operators can perceive."""
+        Two paths share one source of truth:
+
+        * **Fast path** — when the set + order of run IDs is
+          unchanged from the previous tick, walk the rows and only
+          ``update_cell_at`` the cells whose value actually differs.
+          This is the common case once the operator has been parked
+          on the screen for a few seconds: ``list_runs`` is sorted by
+          ``started_at`` desc, so only the mutating cells (status,
+          phase, outer/inner, verdict, updated-at) change between
+          ticks. Skipping the rebuild for a stable run-set keeps the
+          per-tick repaint proportional to *changes*, not *rows*,
+          which is the difference between snappy and visibly laggy
+          scrolling on a ~100 ms VPS round-trip.
+        * **Slow path** — when a run appears, disappears, or the
+          ordering shifts, fall back to ``clear`` + ``add_row``-per-
+          run. Diffing arbitrary reorders is more bug-prone than the
+          gain it would buy on the rare structural change.
+
+        Either way the cursor is pinned back onto the same run_id
+        when possible so a refreshing tick never yanks focus."""
         if self._table is None:
             return
         try:
@@ -541,8 +592,9 @@ class RunListScreen(Screen):
         except OSError:
             rows = []
         self._rows_by_key = {r.run_id: r for r in rows}
-        # Preserve cursor on the same run_id across refreshes when
-        # possible so a row that scrolled doesn't yank focus.
+        new_order = [r.run_id for r in rows]
+        new_cells_by_key = {r.run_id: _row_cells(r) for r in rows}
+
         prev_run_id: Optional[str] = None
         try:
             cursor_row = self._table.cursor_row
@@ -550,12 +602,56 @@ class RunListScreen(Screen):
                 prev_run_id = self._table.get_row_at(cursor_row)[0]
         except Exception:
             prev_run_id = None
+
+        if new_order == self._row_order:
+            for row_idx, run_id in enumerate(new_order):
+                new_cells = new_cells_by_key[run_id]
+                old_cells = self._row_cells_by_key.get(run_id)
+                if old_cells == new_cells:
+                    continue
+                # Only paint the cells that actually differ. A typical
+                # tick mutates status / phase / outer-inner / updated
+                # — three or four cells out of seven — so this skips
+                # the no-op writes that would otherwise force a full
+                # row repaint.
+                if old_cells is None or len(old_cells) != len(new_cells):
+                    differing = range(len(new_cells))
+                else:
+                    differing = [
+                        i for i, (old, new) in enumerate(
+                            zip(old_cells, new_cells)
+                        ) if old != new
+                    ]
+                for col_idx in differing:
+                    try:
+                        self._table.update_cell_at(
+                            Coordinate(row_idx, col_idx),
+                            new_cells[col_idx],
+                        )
+                    except Exception:
+                        # Coordinate drifted (e.g. a concurrent
+                        # structural change we didn't expect): bail
+                        # to the slow path on the next tick by
+                        # forgetting our cached order.
+                        self._row_order = []
+                        self._row_cells_by_key = {}
+                        break
+                else:
+                    self._row_cells_by_key[run_id] = new_cells
+                    continue
+                break
+            else:
+                return
+        # Slow path: structural change (or fast-path bailed) — rebuild
+        # the table from scratch, then re-cache for the next tick.
         self._table.clear()
         for row in rows:
             self._table.add_row(*_row_cells(row), key=row.run_id)
+        self._row_order = list(new_order)
+        self._row_cells_by_key = dict(new_cells_by_key)
         if prev_run_id is not None and prev_run_id in self._rows_by_key:
             try:
-                idx = list(self._rows_by_key.keys()).index(prev_run_id)
+                idx = new_order.index(prev_run_id)
                 self._table.move_cursor(row=idx)
             except (ValueError, IndexError):
                 pass
@@ -1111,6 +1207,14 @@ class RunDetailScreen(Screen):
         self._user_forced_follow_off = False
         self._status_widget: Optional[Static] = None
         self._log_widget: Optional[RichLog] = None
+        # Last string we pushed into the status bar. Compared against
+        # the freshly-rendered text on every tick so the bar's
+        # ``Static.update`` is skipped when nothing changed: the
+        # render cycle that ``update`` triggers is otherwise paid
+        # twice a second forever, and over a high-latency SSH link
+        # that's ~120 redundant frame diffs per minute that compete
+        # with the agent transcript for terminal bandwidth.
+        self._last_status_text: Optional[str] = None
 
     def compose(self) -> ComposeResult:
         # No Header/Footer here: the operator asked for a minimal
@@ -1133,12 +1237,25 @@ class RunDetailScreen(Screen):
         # the raw transcript trumps the per-line one-row budget that
         # the non-TTY ``ai show`` view (``_truncate_visible``) cares
         # about.
+        #
+        # ``max_lines`` bounds the in-memory ring of pre-wrapped
+        # ``Strip`` objects RichLog keeps for the transcript. Without
+        # the cap, a long-lived run accumulates one Strip per logical
+        # line for every byte the agent ever wrote, and Textual has
+        # to walk that list each render — over a ~100 ms SSH link to
+        # a VPS this turns scrolling into a visibly laggy gesture.
+        # The cap matches :data:`_FULL_LOG_SEED_CAP` so the seed and
+        # the steady-state buffer share the same shape: oldest lines
+        # roll off the top once the cap is reached, which is the
+        # behaviour an operator already expects from a tail-style
+        # log viewer.
         log = RichLog(
             id="log-panel",
             wrap=True,
             highlight=False,
             markup=False,
             auto_scroll=True,
+            max_lines=_FULL_LOG_SEED_CAP,
         )
         self._log_widget = log
         yield log
@@ -1160,11 +1277,20 @@ class RunDetailScreen(Screen):
         if self._status_widget is None:
             return
         try:
-            text = _minimal_status_line(self.paths)
+            text = _strip_ansi(_minimal_status_line(self.paths))
         except Exception as exc:
-            self._status_widget.update(f"(status unavailable: {exc})")
+            text = f"(status unavailable: {exc})"
+        # Skip the ``Static.update`` no-op when the rendered string is
+        # identical to the last one we pushed. ``update`` always
+        # triggers a refresh / repaint cycle, even when the new
+        # ``Text`` it builds compares equal to the current widget
+        # content, so a stable run (status / phase / outer-inner /
+        # verdict / paused all unchanged) would otherwise burn one
+        # redraw per tick forever.
+        if text == self._last_status_text:
             return
-        self._status_widget.update(_strip_ansi(text))
+        self._last_status_text = text
+        self._status_widget.update(text)
 
     def _refresh_log(self) -> None:
         if self._log_widget is None:
@@ -1200,16 +1326,25 @@ class RunDetailScreen(Screen):
     def _seed_initial_log(self) -> None:
         # Two seeding modes share one EOF-park step at the end:
         #
-        # * ``initial_log_lines is None`` — stream the whole agent log
-        #   into the widget, line by line. This is the "press Enter on
-        #   a run" path: the operator asked for the full raw
-        #   transcript and we honor it. We iterate the file handle
-        #   instead of ``read_text()`` so memory stays bounded by the
-        #   single longest line rather than the whole file.
+        # * ``initial_log_lines is None`` — render the trailing
+        #   :data:`_FULL_LOG_SEED_CAP` lines of the agent log. This is
+        #   the "press Enter on a run" path: the operator asked for
+        #   the full raw transcript, but we cap the seed because
+        #   streaming a multi-MiB log line-by-line into the ``RichLog``
+        #   widget on mount produces one ``write`` (and one render)
+        #   per line. Over a high-latency SSH link to a VPS that turns
+        #   the screen-open into a visibly slow paint and leaves the
+        #   buffer too fat for snappy scrolling. The cap matches the
+        #   widget's ``max_lines`` ring-buffer so the seed and the
+        #   steady-state buffer share the same shape.
         # * ``initial_log_lines`` is an int — render only that many
-        #   trailing lines via :func:`tail_text_file`. This is the
-        #   ``ai show --lines N`` path: the operator deliberately
-        #   bounded the screen budget.
+        #   trailing lines. This is the ``ai show --lines N`` path:
+        #   the operator deliberately bounded the screen budget.
+        #
+        # Either way :func:`tail_text_file` reads at most a handful of
+        # MiB off the tail of the file rather than the whole thing, so
+        # the open is fast even for an agent log that has been growing
+        # for hours.
         #
         # In both branches we then park the tailer's offset *directly*
         # at EOF — calling ``read_new_lines`` to "burn" historical
@@ -1220,25 +1355,13 @@ class RunDetailScreen(Screen):
             return
 
         if self.paths.agent_log.exists():
-            if self.initial_log_lines is None:
-                try:
-                    with self.paths.agent_log.open(
-                        "r", encoding="utf-8", errors="replace"
-                    ) as fh:
-                        for raw in fh:
-                            self._log_widget.write(raw.rstrip("\r\n"))
-                except OSError:
-                    # File vanished mid-read (rotated / cleaned up):
-                    # fall through to the EOF park so subsequent ticks
-                    # behave as if the screen opened on an empty log.
-                    pass
-            else:
-                from .display import tail_text_file
-
-                for line in tail_text_file(
-                    self.paths.agent_log, lines=self.initial_log_lines,
-                ):
-                    self._log_widget.write(line)
+            seed_lines = (
+                _FULL_LOG_SEED_CAP
+                if self.initial_log_lines is None
+                else self.initial_log_lines
+            )
+            for line in tail_text_file(self.paths.agent_log, lines=seed_lines):
+                self._log_widget.write(line)
         # Always advance to EOF — even if the file does not exist yet,
         # ``seek_to_end`` is a no-op that leaves the offset at 0 ready
         # for the first append.
