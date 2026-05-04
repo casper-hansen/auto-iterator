@@ -242,6 +242,89 @@ async def test_run_detail_log_panel_wraps_long_lines():
             )
 
 
+async def test_run_detail_reflows_transcript_on_terminal_resize():
+    """Resizing the terminal must re-flow already-rendered transcript
+    lines at the new viewport width.
+
+    Reviewer pin: vanilla :class:`RichLog` pre-wraps each ``write``
+    into ``Strip`` objects at the width that was current at write
+    time, then never re-wraps. Resizing the terminal narrower left
+    the historical transcript stuck at the old (wider) wrap geometry
+    — Textual exposed a horizontal scrollbar for the over-wide
+    strips ("blue bar at the bottom"), and short lines that should
+    have re-flowed onto multiple rows kept showing as single
+    too-wide rows. The fix is :class:`_WrapAwareRichLog` mirroring
+    the raw text and replaying it on a width change.
+
+    We seed a long line, capture the post-mount strip count, then
+    resize the terminal narrower and assert (a) the strip count
+    *grew* — proving the re-flow actually re-wrapped — and (b) the
+    widget's ``virtual_size.width`` is bounded by the new viewport
+    width, so Textual won't paint the horizontal scrollbar."""
+    from auto_iterator.tui import RunDetailApp, _WrapAwareRichLog
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run_dir(Path(tmp))
+        # A 240-char line is comfortably wider than the new (60-col)
+        # viewport — we expect it to wrap to ~4 strips after resize,
+        # regardless of the framework-default measurement quirks
+        # that influence the *initial* strip count under
+        # ``run_test``.
+        paths.agent_log.write_text(("x" * 240) + "\n", encoding="utf-8")
+
+        app = RunDetailApp(paths, refresh_seconds=0.5, initial_log_lines=10)
+        async with app.run_test(size=(250, 30)) as pilot:
+            await pilot.pause(0.3)
+            log_widget = app.screen.query_one(
+                "#log-panel", _WrapAwareRichLog,
+            )
+            assert log_widget._raw_lines, (
+                "seed must populate the resize-replay mirror; "
+                "without it, post-resize content would vanish"
+            )
+            initial_strip_count = len(log_widget.lines)
+            initial_virtual_width = log_widget.virtual_size.width
+
+            # Resize the terminal narrower than the seeded line.
+            # ``Pilot.resize_terminal`` drives the same SIGWINCH
+            # path a real terminal would, dispatching ``Resize``
+            # through Textual's screen tree — the path our
+            # ``_WrapAwareRichLog.on_resize`` is wired into.
+            await pilot.resize_terminal(60, 30)
+            # Two ticks: one for the resize event to land and our
+            # ``call_after_refresh`` to be queued, a second for the
+            # queued ``_reflow_raw_lines`` to actually run after
+            # layout settles.
+            await pilot.pause(0.1)
+            await pilot.pause(0.1)
+
+            reflowed_strip_count = len(log_widget.lines)
+            assert reflowed_strip_count > initial_strip_count, (
+                "the 240-char line must re-flow into more strips "
+                "after the terminal narrowed from 250 -> 60 cols; "
+                f"strips went from {initial_strip_count} to "
+                f"{reflowed_strip_count} — wrap did not rerun on "
+                "resize"
+            )
+            # The widget must NOT think it has content wider than
+            # the new viewport — that's the underlying condition
+            # that paints the horizontal scrollbar (the "blue bar
+            # at the bottom" the operator reported on resize).
+            assert log_widget.virtual_size.width <= 60, (
+                "after resize to width 60, "
+                f"virtual_size.width is {log_widget.virtual_size.width}"
+                "; the widget still thinks it has wider content "
+                "than the viewport, which is what triggers the "
+                "blue horizontal scrollbar"
+            )
+            assert log_widget.virtual_size.width < initial_virtual_width, (
+                "virtual_size.width must shrink along with the "
+                "viewport; otherwise the historical strips are "
+                f"still at the old geometry ({initial_virtual_width} "
+                f"-> {log_widget.virtual_size.width})"
+            )
+
+
 async def test_send_modal_writes_guidance_file():
     """Pressing ``s`` → modal → submit → ``control/guidance.txt`` written."""
     from auto_iterator.tui import RunListApp, _PromptModal
@@ -445,8 +528,10 @@ async def test_run_detail_streams_log_lines_incrementally():
                 fh.write(new_chunk)
 
             # Trigger one refresh cycle by waiting longer than the
-            # 0.2 s log interval.
-            await pilot.pause(0.3)
+            # log poll interval. The screen paces the poll at 0.4 s
+            # (set in ``on_mount``); 0.5 s gives a comfortable margin
+            # without making the test noticeably slower.
+            await pilot.pause(0.5)
 
             # The tailer's offset advanced by exactly the appended
             # bytes — proving we never re-read the whole file.
@@ -488,7 +573,7 @@ async def test_run_detail_seed_skips_to_eof_on_huge_log():
                 f"offset={screen._tailer.offset}, size={size}"
             )
             # No new bytes → no advance on subsequent ticks.
-            await pilot.pause(0.3)
+            await pilot.pause(0.5)
             assert screen._tailer.offset == size
 
 
@@ -534,7 +619,7 @@ async def test_log_follow_pins_when_user_scrolls_away():
             # Append new content.
             with paths.agent_log.open("ab") as fh:
                 fh.write(("delta line\n" * 50).encode("utf-8"))
-            await pilot.pause(0.3)
+            await pilot.pause(0.5)
 
             # ``_follow`` is re-derived per tick: scrolled-away
             # viewer → follow off → no auto-scroll.
@@ -568,7 +653,7 @@ async def test_log_follow_resumes_when_user_returns_to_bottom():
             # Drive a tick with an append so ``_follow`` flips off.
             with paths.agent_log.open("ab") as fh:
                 fh.write(b"one\n")
-            await pilot.pause(0.3)
+            await pilot.pause(0.5)
             assert screen._follow is False
 
             # Now the operator scrolls back to the bottom (mouse-end /
@@ -581,7 +666,7 @@ async def test_log_follow_resumes_when_user_returns_to_bottom():
             # and resumes tailing.
             with paths.agent_log.open("ab") as fh:
                 fh.write(b"two\n")
-            await pilot.pause(0.3)
+            await pilot.pause(0.5)
             assert screen._follow is True
             assert log_widget.auto_scroll is True
 

@@ -44,9 +44,11 @@ than crashing.
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Deque, Optional
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -544,7 +546,12 @@ class RunListScreen(Screen):
         self._row_order: list[str] = []
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        # ``show_clock=False``: Textual's Header repaints the clock
+        # cell every second when ``show_clock=True``, which over an
+        # SSH link is one extra ANSI burst per second forever. The
+        # operator already has a wall clock somewhere; the extra
+        # chrome isn't worth the steady-state bandwidth.
+        yield Header(show_clock=False)
         table = DataTable(zebra_stripes=True, cursor_type="row", id="run-table")
         table.add_columns(
             "RUN_ID", "STATUS", "PHASE", "O/I", "VERDICT", "UPDATED", "PROMPT",
@@ -603,58 +610,68 @@ class RunListScreen(Screen):
         except Exception:
             prev_run_id = None
 
-        if new_order == self._row_order:
-            for row_idx, run_id in enumerate(new_order):
-                new_cells = new_cells_by_key[run_id]
-                old_cells = self._row_cells_by_key.get(run_id)
-                if old_cells == new_cells:
-                    continue
-                # Only paint the cells that actually differ. A typical
-                # tick mutates status / phase / outer-inner / updated
-                # — three or four cells out of seven — so this skips
-                # the no-op writes that would otherwise force a full
-                # row repaint.
-                if old_cells is None or len(old_cells) != len(new_cells):
-                    differing = range(len(new_cells))
+        # Coalesce every mutation that follows into a single repaint
+        # via ``app.batch_update``. ``DataTable.update_cell`` and
+        # ``add_row`` each call ``self.refresh`` on the table, so
+        # without batching a 20-row diff that touches 4 cells per
+        # row would queue 80 refresh requests in one tick. Over a
+        # high-latency SSH link those refreshes turn into terminal
+        # bytes that compete with the operator's keyboard / scroll
+        # input — exactly the symptom the user reports.
+        with self.app.batch_update():
+            if new_order == self._row_order:
+                for row_idx, run_id in enumerate(new_order):
+                    new_cells = new_cells_by_key[run_id]
+                    old_cells = self._row_cells_by_key.get(run_id)
+                    if old_cells == new_cells:
+                        continue
+                    # Only paint the cells that actually differ. A
+                    # typical tick mutates status / phase /
+                    # outer-inner / updated — three or four cells out
+                    # of seven — so this skips the no-op writes that
+                    # would otherwise force a full row repaint.
+                    if old_cells is None or len(old_cells) != len(new_cells):
+                        differing = range(len(new_cells))
+                    else:
+                        differing = [
+                            i for i, (old, new) in enumerate(
+                                zip(old_cells, new_cells)
+                            ) if old != new
+                        ]
+                    for col_idx in differing:
+                        try:
+                            self._table.update_cell_at(
+                                Coordinate(row_idx, col_idx),
+                                new_cells[col_idx],
+                            )
+                        except Exception:
+                            # Coordinate drifted (e.g. a concurrent
+                            # structural change we didn't expect):
+                            # bail to the slow path on the next tick
+                            # by forgetting our cached order.
+                            self._row_order = []
+                            self._row_cells_by_key = {}
+                            break
+                    else:
+                        self._row_cells_by_key[run_id] = new_cells
+                        continue
+                    break
                 else:
-                    differing = [
-                        i for i, (old, new) in enumerate(
-                            zip(old_cells, new_cells)
-                        ) if old != new
-                    ]
-                for col_idx in differing:
-                    try:
-                        self._table.update_cell_at(
-                            Coordinate(row_idx, col_idx),
-                            new_cells[col_idx],
-                        )
-                    except Exception:
-                        # Coordinate drifted (e.g. a concurrent
-                        # structural change we didn't expect): bail
-                        # to the slow path on the next tick by
-                        # forgetting our cached order.
-                        self._row_order = []
-                        self._row_cells_by_key = {}
-                        break
-                else:
-                    self._row_cells_by_key[run_id] = new_cells
-                    continue
-                break
-            else:
-                return
-        # Slow path: structural change (or fast-path bailed) — rebuild
-        # the table from scratch, then re-cache for the next tick.
-        self._table.clear()
-        for row in rows:
-            self._table.add_row(*_row_cells(row), key=row.run_id)
-        self._row_order = list(new_order)
-        self._row_cells_by_key = dict(new_cells_by_key)
-        if prev_run_id is not None and prev_run_id in self._rows_by_key:
-            try:
-                idx = new_order.index(prev_run_id)
-                self._table.move_cursor(row=idx)
-            except (ValueError, IndexError):
-                pass
+                    return
+            # Slow path: structural change (or fast-path bailed) —
+            # rebuild the table from scratch, then re-cache for the
+            # next tick.
+            self._table.clear()
+            for row in rows:
+                self._table.add_row(*_row_cells(row), key=row.run_id)
+            self._row_order = list(new_order)
+            self._row_cells_by_key = dict(new_cells_by_key)
+            if prev_run_id is not None and prev_run_id in self._rows_by_key:
+                try:
+                    idx = new_order.index(prev_run_id)
+                    self._table.move_cursor(row=idx)
+                except (ValueError, IndexError):
+                    pass
 
     def _selected_run(self) -> Optional[RunRow]:
         """Return the row currently under the cursor, or ``None`` if empty."""
@@ -1126,6 +1143,149 @@ class _DiffViewer(ModalScreen[None]):
 # ── RunDetailScreen ─────────────────────────────────────────────────────────
 
 
+class _WrapAwareRichLog(RichLog):
+    """A :class:`RichLog` that re-flows its contents on a width change.
+
+    Vanilla ``RichLog`` is built for performance: each ``write`` call
+    renders the content into a list of pre-wrapped :class:`Strip`
+    objects at *the width that was current at write time*, and from
+    then on those strips are baked. ``Strip.from_lines`` is never
+    re-run on the historical content. That trade-off is great for
+    steady-state scrolling — every visible row is just an indexed
+    fetch — but it has two visible failure modes when the terminal
+    is resized:
+
+    1. **Stale wrap.** Strips written at the old width still show up
+       wrapped at that old width even after the viewport changes.
+       The transcript looks "frozen" in its previous geometry.
+    2. **Spurious horizontal scrollbar.** When the terminal shrinks
+       horizontally, the existing strips become wider than
+       ``scrollable_content_region.width``. Textual responds by
+       enabling a horizontal scrollbar (the "blue bar at the bottom"
+       the operator reports), because as far as the widget knows
+       the *content* is too wide to fit.
+
+    Fix: keep a parallel bounded :class:`deque` of the raw text lines
+    that have been written through :meth:`write_line`, and on a real
+    width change ``clear`` the widget and replay the deque so each
+    historical line gets re-rendered at the new width.
+
+    Why not override ``write`` itself instead of adding a sibling?
+    Because :meth:`RichLog.on_resize` re-issues every entry from
+    ``_deferred_renders`` via ``self.write`` once the widget's size
+    is known for the first time. Mirroring inside ``write`` would
+    double-count those entries (the screen had already mirrored
+    them before deferral). A separate ``write_line`` keeps the raw
+    mirror unambiguously the screen's responsibility, while
+    ``write`` and the deferred-render replay path stay untouched.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Bounded mirror of every raw text line the screen has handed
+        # us. Same ring size as the widget's strip cap so the buffer
+        # we keep around for re-wrap is no fatter than what the
+        # widget is already willing to display: under heavy-write
+        # conditions the oldest entries fall off both ends in
+        # lockstep and we don't surprise the operator with content
+        # the widget has already aged out.
+        cap = self.max_lines if self.max_lines is not None else 10_000
+        self._raw_lines: Deque[str] = deque(maxlen=cap)
+        # Last viewport width we successfully re-flowed at. Compared
+        # against fresh ``Resize`` events to debounce away the
+        # ``height changed but width didn't`` events Textual fires
+        # liberally during layout settling.
+        self._last_wrap_width: int = 0
+
+    def write_line(
+        self, line: str, *, scroll_end: Optional[bool] = None,
+    ) -> None:
+        """Append *line* to the log, mirroring it for resize replay.
+
+        Callers MUST go through this helper rather than
+        :meth:`RichLog.write` for any content they want preserved
+        across a re-flow. Direct ``write`` calls (and the deferred-
+        render replay inside Textual's :meth:`RichLog.on_resize`)
+        intentionally bypass the mirror so we don't double-count.
+
+        ``scroll_end`` mirrors :meth:`RichLog.write`'s parameter and
+        defaults to ``None`` so the widget's own ``auto_scroll`` flag
+        decides — that's what the seed path (``_seed_initial_log``)
+        relies on to land at the tail when deferred renders are
+        replayed once the widget learns its size. The runtime burst
+        path passes ``scroll_end=False`` explicitly to suppress the
+        per-line scroll request and folds them into one
+        ``scroll_end`` call after the burst.
+        """
+        self._raw_lines.append(line)
+        self.write(line, scroll_end=scroll_end)
+
+    def on_resize(self, event: events.Resize) -> None:
+        # Let the base class drain any deferred renders first so the
+        # widget reaches a consistent ``_size_known`` state before
+        # we touch it.
+        super().on_resize(event)
+
+        new_width = event.size.width
+        if new_width <= 0:
+            return
+        if new_width == self._last_wrap_width:
+            return
+
+        self._last_wrap_width = new_width
+
+        if not self._raw_lines:
+            return
+
+        # Defer the re-flow until after the next refresh. This
+        # matters because Textual's layout pass — the one that
+        # finally sets ``scrollable_content_region`` to the new
+        # viewport width — runs AFTER ``on_resize`` event handlers,
+        # not during them. Re-writing inline at this point would
+        # measure the renderable against the stale (pre-resize)
+        # content region, which on the very first resize is
+        # ``Region(0, 0, 0, 0)`` and wraps every line at Rich's
+        # default 80-column fallback. ``call_after_refresh`` parks
+        # the work on the queue immediately *after* the next layout
+        # / refresh cycle, where ``scrollable_content_region`` has
+        # the correct width and the wrap actually re-flows the
+        # transcript at the new geometry. The visible cost is one
+        # extra frame between the resize event and the reflowed
+        # paint — over a high-ping link this is unmeasurable next
+        # to the SIGWINCH round trip itself.
+        self.call_after_refresh(self._reflow_raw_lines)
+
+    def _reflow_raw_lines(self) -> None:
+        """Re-render every mirrored raw line at the current width.
+
+        Called from :meth:`on_resize` via ``call_after_refresh`` so
+        that ``scrollable_content_region`` reports the new viewport
+        width by the time we re-issue the writes."""
+        if not self._raw_lines:
+            return
+
+        # Capture the follow state before we wipe the widget so an
+        # operator who was parked at the tail stays at the tail
+        # post-reflow (otherwise ``clear`` would leave us at scroll
+        # position 0 and the next tick would interpret that as
+        # "scrolled away").
+        was_at_end = self.scroll_y >= self.max_scroll_y - 1
+        snapshot = list(self._raw_lines)
+
+        # ``clear`` only touches the widget's own state — strips,
+        # line cache, deferred renders, virtual size — and leaves
+        # ``self._raw_lines`` alone. Replay through ``self.write``
+        # (not ``write_line``) so the mirror isn't re-appended on
+        # top of itself.
+        self.clear()
+        with self.app.batch_update():
+            for raw in snapshot:
+                self.write(raw, scroll_end=False)
+
+        if was_at_end:
+            self.scroll_end(animate=False, immediate=True, x_axis=False)
+
+
 class RunDetailScreen(Screen):
     """Per-run detail view: minimal status bar + full agent transcript.
 
@@ -1163,6 +1323,30 @@ class RunDetailScreen(Screen):
     RunDetailScreen #log-panel {
         height: 1fr;
         border: none;
+        /* Scrollbars disabled. Textual's scrollbar widget repaints
+           the thumb on every scroll position change and *also*
+           swaps to ``$scrollbar-color-hover`` whenever the mouse
+           pointer crosses it — so on a high-ping SSH link, every
+           wheel notch and every stray mouse move turns into an
+           extra ANSI burst that competes with the actual content
+           diff for terminal bandwidth. The ``g`` / ``G`` / ``j`` /
+           ``k`` / ``f`` bindings already give keyboard operators a
+           full set of scroll affordances; mouse-wheel scrolling
+           still works on the panel even without a visible thumb.
+
+           ``scrollbar-size-horizontal: 0`` is belt-and-suspenders
+           against the "blue bar at the bottom on resize" symptom:
+           even though :class:`_WrapAwareRichLog` re-flows the
+           transcript on a width change, the replay isn't atomic
+           with the resize event — for the brief window between
+           Textual recomputing the viewport and our re-flow
+           landing, the still-old strips can be wider than the
+           new ``scrollable_content_region.width``, which is what
+           was painting the horizontal scrollbar. The log viewer
+           wraps; it is never meaningfully horizontally scrolled,
+           so the bar has no operator value either way. */
+        scrollbar-size-vertical: 0;
+        scrollbar-size-horizontal: 0;
     }
     """
 
@@ -1206,7 +1390,7 @@ class RunDetailScreen(Screen):
         self._follow = True
         self._user_forced_follow_off = False
         self._status_widget: Optional[Static] = None
-        self._log_widget: Optional[RichLog] = None
+        self._log_widget: Optional[_WrapAwareRichLog] = None
         # Last string we pushed into the status bar. Compared against
         # the freshly-rendered text on every tick so the bar's
         # ``Static.update`` is skipped when nothing changed: the
@@ -1249,13 +1433,41 @@ class RunDetailScreen(Screen):
         # roll off the top once the cap is reached, which is the
         # behaviour an operator already expects from a tail-style
         # log viewer.
-        log = RichLog(
+        #
+        # ``min_width=0`` overrides RichLog's 78-column floor so a
+        # short line ("inner_started", "review_finished verdict=…")
+        # stops being padded out to a 78-cell ``Strip``. With wrap
+        # enabled and a viewport that's typically wider than the
+        # content, the floor was inflating every short transcript
+        # row by 4-5× the cells it actually needed: more cells per
+        # strip = more bytes Textual has to diff per scroll = more
+        # bandwidth burned on the SSH link. The widget still uses
+        # ``shrink=True`` (RichLog's default) to fold long lines
+        # into the viewport width, so wrapping behaviour is
+        # unaffected.
+        #
+        # ``auto_scroll`` stays on so the seed path's deferred
+        # writes (the screen mounts before the first ``Resize`` event,
+        # so every ``write`` lands in :attr:`RichLog._deferred_renders`
+        # and is replayed later) snap the viewport to the tail when
+        # they're finally rendered. The runtime burst loop in
+        # :meth:`_refresh_log` overrides this with ``scroll_end=False``
+        # per ``write`` and does a single explicit ``scroll_end`` at
+        # the end of the burst — that fold collapses the previous
+        # "one scroll request per appended line" pattern into a
+        # single repaint, which is the actual SSH-bandwidth win. The
+        # widget-level ``auto_scroll`` is also kept in sync with
+        # :attr:`_follow` each tick so an operator who scrolled away
+        # sees ``auto_scroll`` flip off (asserted by the smoke
+        # tests).
+        log = _WrapAwareRichLog(
             id="log-panel",
             wrap=True,
             highlight=False,
             markup=False,
             auto_scroll=True,
             max_lines=_FULL_LOG_SEED_CAP,
+            min_width=0,
         )
         self._log_widget = log
         yield log
@@ -1268,8 +1480,26 @@ class RunDetailScreen(Screen):
         # polls only surface new bytes.
         self._seed_initial_log()
         self._refresh_status()
+        # Two periodic timers feed the screen — the status bar and
+        # the agent log. Each timer tick wakes the event loop, runs
+        # the handler, and (often) schedules a widget refresh whose
+        # diff has to ship across the SSH link before the operator's
+        # next keystroke / scroll wheel event can be acted on. Above
+        # ~3 Hz combined, those timers start visibly competing with
+        # user input on a high-latency link.
+        #
+        # We hold the status timer at the operator-facing
+        # ``--refresh`` interval (default 0.5 s, override via the
+        # CLI flag) but pace the log poll deliberately slower than
+        # the previous 0.2 s default. 0.4 s is still well below the
+        # threshold at which an agent transcript stops feeling
+        # "live" — a chatty agent emits at most a few lines per
+        # second, and bursts are still drained in a single tick via
+        # :meth:`_refresh_log`'s ``app.batch_update`` block — but it
+        # halves the timer-driven render budget the screen pays
+        # while the operator is trying to scroll.
         self.set_interval(self.refresh_seconds, self._refresh_status)
-        self.set_interval(0.2, self._refresh_log)
+        self.set_interval(0.4, self._refresh_log)
 
     # ── refresh handlers ──
 
@@ -1304,24 +1534,66 @@ class RunDetailScreen(Screen):
         # widget's own bindings) doesn't route through our custom
         # ``j``/``k``/``g``/``G`` actions, so the only source of truth
         # for "is the operator currently at the bottom?" is the
-        # widget's ``is_vertical_scroll_end`` flag. Doing the sync
-        # here means a mouse-scrolled-up viewer never gets yanked
-        # back to the tail by an incoming append, while a viewer
-        # parked at the tail keeps streaming.
+        # widget's scroll geometry. Doing the sync here means a
+        # mouse-scrolled-up viewer never gets yanked back to the tail
+        # by an incoming append, while a viewer parked at the tail
+        # keeps streaming.
+        #
+        # The "at the bottom" check uses a one-row tolerance instead
+        # of the strict ``is_vertical_scroll_end`` equality: when a
+        # burst of writes arrives, the layout settles a frame later
+        # than the scroll position, so a viewer that *was* parked at
+        # EOF can momentarily report ``scroll_y == max_scroll_y - 1``
+        # and silently disengage follow. The tolerance restores the
+        # "stay glued to the tail across bursts" property without
+        # making the check any more permissive in practice — a
+        # genuine scroll-up moves the offset by tens of rows, not one.
         #
         # The explicit ``f`` toggle still matters: it forces follow
         # back on (and snaps to end) so an operator who has scrolled
         # up can resume tailing without manually scrolling to the
         # bottom row.
         if self._user_forced_follow_off:
-            # Operator pressed ``f`` to disable follow; respect that
-            # even when they happen to be parked at EOF.
             self._follow = False
         else:
-            self._follow = bool(self._log_widget.is_vertical_scroll_end)
+            self._follow = (
+                self._log_widget.scroll_y >= self._log_widget.max_scroll_y - 1
+            )
+        # Mirror ``_follow`` onto the widget's own ``auto_scroll`` so
+        # the visible state matches what the smoke tests assert and
+        # so any code path that bypasses our burst loop (a future
+        # action / write) inherits the right default.
         self._log_widget.auto_scroll = self._follow
-        for line in new_lines:
-            self._log_widget.write(line)
+
+        # Coalesce the whole burst into one repaint via
+        # ``App.batch_update`` and pass ``scroll_end=False`` to each
+        # ``write`` so RichLog skips its built-in per-line scroll
+        # request. Without this, a 50-line burst from a chatty agent
+        # would queue 50 ``scroll_end`` calls (one per ``write``) and
+        # 50 widget-refresh notifications inside one tick — each of
+        # those translates into terminal bytes Textual has to ship
+        # over the SSH link before the operator's next scroll wheel
+        # event can be acted on, which is the visible source of the
+        # "scrolling lags during heavy output" complaint.
+        with self.app.batch_update():
+            for line in new_lines:
+                # ``write_line`` mirrors the raw text into the
+                # widget's resize-replay deque alongside the actual
+                # ``write``. A direct ``write`` would land in the
+                # widget's pre-wrapped strip list but would NOT be
+                # available for re-flowing on a future terminal
+                # resize, so the transcript would visibly
+                # de-synchronise from the new viewport width.
+                self._log_widget.write_line(line, scroll_end=False)
+        if self._follow:
+            # One snap-to-tail for the whole tick. ``animate=False`` +
+            # ``immediate=True`` means the scroll lands in this frame
+            # instead of being smeared across the next handful of
+            # animation frames — each interpolated frame would
+            # otherwise be a separate viewport repaint over SSH.
+            self._log_widget.scroll_end(
+                animate=False, immediate=True, x_axis=False,
+            )
 
     def _seed_initial_log(self) -> None:
         # Two seeding modes share one EOF-park step at the end:
@@ -1360,8 +1632,35 @@ class RunDetailScreen(Screen):
                 if self.initial_log_lines is None
                 else self.initial_log_lines
             )
-            for line in tail_text_file(self.paths.agent_log, lines=seed_lines):
-                self._log_widget.write(line)
+            # Coalesce the whole seed burst into a single repaint so
+            # the operator never sees the screen draw in line by line
+            # over SSH — Textual would otherwise queue one widget
+            # refresh per ``write`` and stream a partial diff for
+            # each. ``app.batch_update`` suspends those refreshes for
+            # the duration of the ``with`` block, and the writes that
+            # land before the widget's first Resize event are still
+            # buffered in :attr:`RichLog._deferred_renders` exactly
+            # as before — ``batch_update`` is a no-op for that path,
+            # which is what makes it safe to wrap unconditionally.
+            with self.app.batch_update():
+                for line in tail_text_file(
+                    self.paths.agent_log, lines=seed_lines,
+                ):
+                    # Same reason as in ``_refresh_log``: route every
+                    # seeded line through ``write_line`` so it lands
+                    # in the resize-replay mirror. Without this a
+                    # post-seed terminal resize would leave the
+                    # initial transcript wrapped at the old width
+                    # while only newly-arriving lines re-flowed.
+                    self._log_widget.write_line(line)
+            # Snap to the tail once the seed is in. With the widget's
+            # ``auto_scroll=False`` we don't get this for free from
+            # the writes themselves, and an operator opening the
+            # detail screen expects to land at "what's happening
+            # right now" rather than at line 1 of the transcript.
+            self._log_widget.scroll_end(
+                animate=False, immediate=True, x_axis=False,
+            )
         # Always advance to EOF — even if the file does not exist yet,
         # ``seek_to_end`` is a no-op that leaves the offset at 0 ready
         # for the first append.
@@ -1432,15 +1731,40 @@ class RunDetailScreen(Screen):
 # ── App wrappers ────────────────────────────────────────────────────────────
 
 
+# Animation level applied to both apps.
+#
+# Textual ships three levels — ``"full"`` (the default; smooth
+# scrolls, focus-ring fades, dialog slide-ins), ``"basic"`` (only
+# state-changing animations), and ``"none"`` (no tweening at all).
+# We pin to ``"none"`` because the operator console is overwhelmingly
+# driven over SSH to a remote VPS, and every interpolated animation
+# frame is a separate viewport diff Textual has to ship across the
+# wire before the next keystroke or scroll wheel event can be acted
+# on. Locally the animations are pleasant chrome; over a ~100 ms
+# round-trip they are the difference between "scroll feels glued to
+# the wheel" and "scroll feels like it's mid-Atlantic". The env var
+# ``TEXTUAL_ANIMATIONS`` (read by the constructor) still wins if an
+# operator wants the full experience back; we just lower the default.
+_TUI_ANIMATION_LEVEL = "none"
+
+
 class RunListApp(App):
     """Top-level app for the bare ``ai`` command (no subcommand)."""
 
     TITLE = "auto-iterator"
     SUB_TITLE = "operator console"
 
+    # Disable the built-in ctrl+p command palette. We don't expose
+    # any commands through it, and leaving it on means every
+    # keystroke pays for a palette-binding check plus the palette
+    # adds a focus-trap widget Textual has to track in its hover /
+    # focus walks. Free win.
+    ENABLE_COMMAND_PALETTE = False
+
     def __init__(self, runs_dir: Path) -> None:
         super().__init__()
         self.runs_dir = runs_dir
+        self.animation_level = _TUI_ANIMATION_LEVEL
 
     def on_mount(self) -> None:
         self.push_screen(RunListScreen(self.runs_dir))
@@ -1454,6 +1778,8 @@ class RunDetailApp(App):
 
     TITLE = "auto-iterator"
 
+    ENABLE_COMMAND_PALETTE = False
+
     def __init__(
         self,
         paths: RunPaths,
@@ -1466,6 +1792,7 @@ class RunDetailApp(App):
         self.refresh_seconds = refresh_seconds
         self.initial_log_lines = initial_log_lines
         self.SUB_TITLE = paths.run_id
+        self.animation_level = _TUI_ANIMATION_LEVEL
 
     def on_mount(self) -> None:
         self.push_screen(
