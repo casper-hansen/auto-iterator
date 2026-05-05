@@ -1253,7 +1253,7 @@ def test_main_show_keyboard_interrupt_exits_zero(capsys, monkeypatch) -> None:
     """Top-level ``ai show`` swallows KeyboardInterrupt with exit 0.
 
     Forces the TUI path by pinning ``sys.stdout.isatty`` to True, then
-    monkeypatches the lazy import so the Textual app entry point
+    monkeypatches the lazy import so the pyratatui app entry point
     raises :class:`KeyboardInterrupt`. The wrapper in
     :func:`auto_iterator.cli.main` is the last line of defence against
     a Ctrl-C in the live loop turning into a noisy traceback."""

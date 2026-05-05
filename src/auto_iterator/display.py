@@ -731,8 +731,8 @@ def state_json_text(paths: RunPaths) -> str:
 class LogTailer:
     """Stream new lines from a growing text file by remembering the offset.
 
-    The Textual agent-output panel polls this on every tick (~0.2 s)
-    so it must:
+    The pyratatui agent-output panel polls this on every refresh
+    (~0.4 s) so it must:
 
     * Read **only the new bytes** since the last call. We track
       ``self._offset`` and seek there on every read; an ``stat()`` is
@@ -751,7 +751,7 @@ class LogTailer:
       tick when the rest of the codepoint is on disk.
 
     The class is deliberately stdlib-only: it can be unit-tested
-    without spinning up Textual, and other callers (a future ``ai
+    without spinning up the TUI, and other callers (a future ``ai
     show --follow``, e.g.) can re-use the same primitive.
     """
 

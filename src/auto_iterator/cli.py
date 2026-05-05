@@ -631,15 +631,16 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
     Default flow (in priority order):
 
     * ``--json`` → one-shot raw ``state.json`` (scriptable). Never
-      imports Textual.
+      imports the TUI library.
     * ``--once`` / ``--logs`` → one-shot combined text view. Never
-      imports Textual.
-    * Non-TTY stdout → same as ``--once``. Never imports Textual.
-    * Interactive TTY → opens the per-run Textual detail screen.
+      imports the TUI library.
+    * Non-TTY stdout → same as ``--once``. Never imports the TUI
+      library.
+    * Interactive TTY → opens the per-run pyratatui detail screen.
 
     The TTY path lazy-imports :mod:`auto_iterator.tui` so plain
     ``ai ls`` / ``ai show --json`` / ``ai show --once`` invocations
-    don't pay the Textual startup cost.
+    don't pay the pyratatui native-binding startup cost.
     """
     run = _resolve_run(runs_dir, args.run_id)
 
@@ -659,7 +660,7 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
 
     once = bool(getattr(args, "once", False) or getattr(args, "logs", False))
     if once or not _stdout_is_tty():
-        # Byte-identical to today's one-shot output. No Textual.
+        # Byte-identical to today's one-shot output. No pyratatui.
         from .display import render_combined_view
         sys.stdout.write(render_combined_view(
             run.paths,
@@ -669,8 +670,9 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
         return EXIT_OK
 
     refresh = max(0.05, float(getattr(args, "refresh", 0.4) or 0.4))
-    # TTY default → Textual detail screen. Lazy-imported so the
-    # non-TTY paths above don't pull in Textual on every invocation.
+    # TTY default → pyratatui detail screen. Lazy-imported so the
+    # non-TTY paths above don't pull in the native binding on every
+    # invocation.
     from .tui import run_detail_app
     return run_detail_app(
         run.paths,
@@ -1148,12 +1150,13 @@ def _maybe_confirm(args: argparse.Namespace) -> bool:
 
 
 def cmd_tui(_args: argparse.Namespace, runs_dir: Path) -> int:
-    """Open the interactive Textual run-list TUI.
+    """Open the interactive pyratatui run-list TUI.
 
     Routed to from the bare ``ai`` invocation (no subcommand). The
     TUI is lazy-imported so ``ai ls`` / ``ai show --json`` etc. don't
-    pay the Textual startup cost. Returning the app's exit code makes
-    Ctrl-C from inside the TUI propagate cleanly through the shell."""
+    pay the pyratatui native-binding startup cost. Returning the
+    app's exit code makes Ctrl-C from inside the TUI propagate
+    cleanly through the shell."""
     if not _stdout_is_tty():
         print(
             "error: `ai` (no subcommand) opens an interactive TUI; "

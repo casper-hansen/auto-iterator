@@ -1,6 +1,6 @@
 """Operator-action primitives — the file-drop side of the protocol.
 
-The ``ai`` CLI (``cli.py``) and the Textual UI (``tui.py``) both express
+The ``ai`` CLI (``cli.py``) and the pyratatui UI (``tui.py``) both express
 operator intents the same way: drop the appropriate file under
 ``<run_dir>/control/`` (or spawn a detached runner via ``Popen``). To
 keep the two front-ends honest about the protocol — and to keep the

@@ -4,31 +4,28 @@ build-backend = "hatchling.build"
 
 [project]
 name = "auto-iterator"
-version = "0.2.0"
+version = "0.3.0"
 description = "Automated implement → review → fix loop with a filesystem-backed operator CLI"
-requires-python = ">=3.9"
+# pyratatui ships ``cp310-abi3`` wheels, so 3.10 is the floor. The
+# Rust-backed bindings keep the TUI render loop in native code, which
+# is what unblocks butter-smooth scrolling over high-latency SSH —
+# the previous Textual implementation paid one Python-side widget
+# repaint per frame and was visibly laggy.
+requires-python = ">=3.10"
 dependencies = [
-    # Textual drives the interactive ``ai`` / ``ai show`` TUI.
-    # Lower bound 0.60 = first release with the modern ``RichLog`` widget
-    # and the ``Pilot`` test harness shape we rely on. Upper bound caps
-    # the next major so a future breaking change can't silently land in
-    # ``uv lock --upgrade``. Current stable on PyPI is 8.x.
-    "textual>=0.60,<9",
+    # pyratatui drives the interactive ``ai`` / ``ai show`` TUI. Pin
+    # to the 0.2.x line: that's the first series with the
+    # ``Terminal``/``AsyncTerminal``/``poll_event`` shape we rely on
+    # and stable list/table state APIs. Upper bound caps the next
+    # minor so a future API break can't silently land via
+    # ``uv lock --upgrade``.
+    "pyratatui>=0.2.7,<0.3",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    # ``run_test`` returns an async generator; pytest-asyncio drives
-    # the smoke tests in ``tests/test_tui_smoke.py`` against it.
-    "pytest-asyncio>=0.21",
 ]
-
-[tool.pytest.ini_options]
-# ``auto`` mode means every ``async def test_...`` is executed without
-# requiring a per-test ``@pytest.mark.asyncio`` decorator.
-asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
 
 [project.scripts]
 ai = "auto_iterator.cli:main"

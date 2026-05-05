@@ -2,22 +2,27 @@
 
 The big task-spec promise is that the **stateless / scriptable** flags —
 ``--json``, ``--once``, ``--logs``, and the non-TTY auto-fallback — keep
-working byte-identically and *do not* import :mod:`textual`. Importing
-Textual on every ``ai ls`` invocation would bolt a ~120 ms startup cost
-onto operator commands that have no business with a TUI.
+working byte-identically and *do not* import :mod:`pyratatui`. Importing
+pyratatui on every ``ai ls`` invocation would bolt the native-binding
+startup cost onto operator commands that have no business with a TUI.
 
 These tests cover the dispatch surface specifically:
 
 * ``--json`` → calls ``state_json_text``, emits parseable JSON, never
-  imports ``textual``.
+  imports ``pyratatui``.
 * ``--once`` → calls ``render_combined_view``, emits the snapshot, never
-  imports ``textual``.
-* Non-TTY default → behaves like ``--once``, never imports ``textual``.
+  imports ``pyratatui``.
+* Non-TTY default → behaves like ``--once``, never imports ``pyratatui``.
 * ``--logs`` → documented internal alias for ``--once``.
 
-Each "no Textual import" check uses ``importlib.invalidate_caches`` plus
-:func:`sys.modules.pop` so the test is meaningful even if a previous
-test in the same process had already imported ``textual``.
+Each "no pyratatui import" check uses ``importlib.invalidate_caches``
+plus :func:`sys.modules.pop` so the test is meaningful even if a
+previous test in the same process had already imported ``pyratatui``.
+
+Historical note: the project used to be built on Textual, which had
+the same "don't pay the TUI startup cost on scriptable flags" rule.
+After the migration to pyratatui the contract is identical — only the
+module name changed.
 """
 
 from __future__ import annotations
@@ -72,40 +77,55 @@ def _seed_run(runs_dir: Path) -> RunPaths:
     return paths
 
 
-def _drop_textual_from_sys_modules() -> None:
+def _drop_tui_modules_from_sys_modules() -> None:
     """Reset ``sys.modules`` so a follow-up import is meaningful.
 
-    We only drop the *top-level* ``textual`` namespace (and the
-    ``auto_iterator.tui`` module that re-exports the live entry
-    points). Sub-modules (``textual.app``, ``textual.widgets``, …) are
-    left in place because:
+    Drops both the legacy ``textual`` namespace (kept around because
+    parts of the test process may still have it imported transitively
+    via tooling) and the ``pyratatui`` namespace that the live TUI
+    binds against. Sub-modules of each TUI framework are left in
+    place because re-importing them after a full purge is brittle —
+    what we want to assert is "the dispatch path doesn't *trigger* a
+    fresh import" of the top-level package, which is what a parent
+    process running ``ai show --json`` from a fresh interpreter
+    observes.
 
-    * Re-importing them after a full purge is expensive and brittle —
-      Textual's importtime is exactly what we're protecting against.
-    * The contract under test is "the dispatch path doesn't *trigger*
-      a fresh import". We assert the absence of the top-level
-      ``textual`` symbol after the call, which is what a parent
-      process running ``ai show --json`` from a fresh interpreter
-      observes.
-    """
+    NOTE: We deliberately do **not** drop ``auto_iterator.tui`` here.
+    ``auto_iterator.tui`` lazy-imports ``pyratatui`` only inside
+    ``_run_app_loop``, so its mere presence in ``sys.modules`` does
+    not violate the "scriptable flags don't pay the TUI cold-start
+    cost" contract. Dropping it, however, would leak across into
+    ``tests/test_tui_smoke.py``: that module imports ``RunListApp``
+    and friends at *collection* time, so a re-import here would
+    yield two distinct module objects (the original one bound to
+    ``RunListApp`` and a fresh one that ``mock.patch`` would patch),
+    making the smoke tests' ``mock.patch("auto_iterator.tui.list_runs")``
+    silently miss the class's bound reference. The reviewer caught
+    this regression with a co-run of the two files; keeping the
+    module pinned is the simplest fix that keeps both contracts."""
     for name in list(sys.modules):
-        if name == "textual" or name.startswith("textual."):
+        if name == "pyratatui" or name.startswith("pyratatui."):
             sys.modules.pop(name, None)
-    sys.modules.pop("auto_iterator.tui", None)
+        elif name == "textual" or name.startswith("textual."):
+            sys.modules.pop(name, None)
+
+
+# Backwards-compat alias: older test scaffolding may still call this.
+_drop_textual_from_sys_modules = _drop_tui_modules_from_sys_modules
 
 
 # ── --json path ────────────────────────────────────────────────────────────
 
 
-def test_show_json_emits_parseable_json_without_importing_textual(
+def test_show_json_emits_parseable_json_without_importing_tui(
     capsys, monkeypatch,
 ) -> None:
-    """``ai show --json`` emits parseable JSON and never imports textual.
+    """``ai show --json`` emits parseable JSON and never imports the TUI lib.
 
     This is the scriptable contract — anything that pipes
     ``ai show … --json`` through ``jq`` must keep working, and the
-    Textual cold-start cost must not land on it."""
-    _drop_textual_from_sys_modules()
+    pyratatui native-binding cold-start cost must not land on it."""
+    _drop_tui_modules_from_sys_modules()
 
     with tempfile.TemporaryDirectory() as tmp:
         paths = _seed_run(Path(tmp))
@@ -117,25 +137,28 @@ def test_show_json_emits_parseable_json_without_importing_textual(
         # state.json shape: at minimum the run id round-trips.
         assert payload.get("run_id") == paths.run_id
 
+    assert "pyratatui" not in sys.modules, (
+        "ai show --json must not import pyratatui; "
+        f"sys.modules contains: {[k for k in sys.modules if 'pyratatui' in k]}"
+    )
     assert "textual" not in sys.modules, (
-        "ai show --json must not import textual; "
-        f"sys.modules contains: {[k for k in sys.modules if 'textual' in k]}"
+        "ai show --json must not import textual either"
     )
 
 
 # ── --once path ────────────────────────────────────────────────────────────
 
 
-def test_show_once_uses_render_combined_view_without_importing_textual(
+def test_show_once_uses_render_combined_view_without_importing_tui(
     capsys, monkeypatch,
 ) -> None:
     """``ai show --once`` is byte-identical to ``render_combined_view``.
 
-    The "no Textual import" half is the cheap-startup contract. The
+    The "no pyratatui import" half is the cheap-startup contract. The
     "byte-identical" half is the stronger contract: shells that already
     parse the snapshot (``grep``, ``awk``, log-aggregators) must see
     exactly today's bytes."""
-    _drop_textual_from_sys_modules()
+    _drop_tui_modules_from_sys_modules()
 
     # Capture the call args render_combined_view was invoked with so we
     # can replay them and compare bytes.
@@ -169,9 +192,9 @@ def test_show_once_uses_render_combined_view_without_importing_textual(
             "ai show --once must be byte-identical to render_combined_view"
         )
 
-    assert "textual" not in sys.modules, (
-        "ai show --once must not import textual; "
-        f"sys.modules contains: {[k for k in sys.modules if 'textual' in k]}"
+    assert "pyratatui" not in sys.modules, (
+        "ai show --once must not import pyratatui; "
+        f"sys.modules contains: {[k for k in sys.modules if 'pyratatui' in k]}"
     )
 
 
@@ -179,8 +202,8 @@ def test_show_logs_alias_behaves_like_once(capsys, monkeypatch) -> None:
     """``ai show --logs`` is the documented internal alias for ``--once``.
 
     The CLI keeps the alias around for muscle memory; verify it still
-    routes to ``render_combined_view`` and stays Textual-free."""
-    _drop_textual_from_sys_modules()
+    routes to ``render_combined_view`` and stays TUI-library-free."""
+    _drop_tui_modules_from_sys_modules()
 
     with tempfile.TemporaryDirectory() as tmp:
         paths = _seed_run(Path(tmp))
@@ -199,7 +222,7 @@ def test_show_logs_alias_behaves_like_once(capsys, monkeypatch) -> None:
         expected = real_render(paths, event_lines=12, log_lines=30)
         assert out_via_logs == expected
 
-    assert "textual" not in sys.modules
+    assert "pyratatui" not in sys.modules
 
 
 # ── non-TTY default ────────────────────────────────────────────────────────
@@ -211,9 +234,9 @@ def test_show_non_tty_default_falls_back_to_once(capsys, monkeypatch) -> None:
     The dispatch heuristic is ``not sys.stdout.isatty()`` → take the
     one-shot path. ``capsys`` already exposes a non-TTY stdout, so we
     don't have to fake it; we just assert the output is the combined
-    view's bytes and Textual is absent.
+    view's bytes and pyratatui is absent.
     """
-    _drop_textual_from_sys_modules()
+    _drop_tui_modules_from_sys_modules()
 
     with tempfile.TemporaryDirectory() as tmp:
         paths = _seed_run(Path(tmp))
@@ -229,13 +252,13 @@ def test_show_non_tty_default_falls_back_to_once(capsys, monkeypatch) -> None:
         )
         assert out == expected
 
-    assert "textual" not in sys.modules, (
-        "non-TTY ai show must not import textual; "
-        f"sys.modules contains: {[k for k in sys.modules if 'textual' in k]}"
+    assert "pyratatui" not in sys.modules, (
+        "non-TTY ai show must not import pyratatui; "
+        f"sys.modules contains: {[k for k in sys.modules if 'pyratatui' in k]}"
     )
 
 
-# ── TTY default → Textual ──────────────────────────────────────────────────
+# ── TTY default → pyratatui TUI ────────────────────────────────────────────
 
 
 def test_show_tty_default_lazy_imports_tui(capsys, monkeypatch) -> None:
@@ -244,8 +267,8 @@ def test_show_tty_default_lazy_imports_tui(capsys, monkeypatch) -> None:
     We don't actually run the TUI — that would block on stdin — we
     only assert the dispatch path *would* land at
     :func:`auto_iterator.tui.run_detail_app`. Pinning the symbol with
-    ``monkeypatch`` lets us return a sentinel without spinning up
-    Textual.
+    ``monkeypatch`` lets us return a sentinel without spinning up the
+    pyratatui native binding.
     """
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
@@ -258,7 +281,7 @@ def test_show_tty_default_lazy_imports_tui(capsys, monkeypatch) -> None:
         return EXIT_OK
 
     # Patch on the ``tui`` module so the lazy import inside
-    # ``cmd_show`` resolves to our fake. We don't drop ``textual``
+    # ``cmd_show`` resolves to our fake. We don't drop ``pyratatui``
     # from sys.modules here — this test *expects* the lazy import to
     # happen, and patching the symbol is enough to keep it cheap.
     import auto_iterator.tui as _tui
