@@ -1807,10 +1807,47 @@ class RunDetailApp(App):
 # ── Entry points used by ``cli`` ────────────────────────────────────────────
 
 
+# We launch every TUI surface with mouse capture *off*. Default
+# ``App.run()`` enables mouse-tracking (DECSET 1000/1003/1006) so
+# Textual can route clicks/scrolls to widgets — but that has three
+# costs the operator workflow doesn't want:
+#
+# 1. **Native terminal selection breaks.** Once mouse-tracking is on,
+#    the terminal forwards every press/drag/release to the app instead
+#    of using them for its built-in click-and-drag selection. Operators
+#    who want to copy a stack trace, a tool-call payload or a verdict
+#    string out of the agent transcript end up with nothing to copy.
+# 2. **Textual's in-app selection doesn't fill the gap for ``RichLog``.**
+#    ``App.ALLOW_SELECT`` is ``True`` and ``Screen`` ships a
+#    ``ctrl+c → screen.copy_text`` binding, but ``RichLog.get_selection``
+#    in textual ≤8.x renders into a ``Panel`` rather than a ``Text`` /
+#    ``Content``, so the screen-level extractor returns ``None`` and
+#    the OSC-52 copy is a no-op even when a drag did register. The
+#    detail screen *is* a ``RichLog``, so the framework's selection
+#    path is dead weight here.
+# 3. **Hover highlighting fires on every mouse move.** Mouse-tracking
+#    drives the ``:hover`` pseudo-class, which paints a highlight
+#    under the cursor on whatever widget the operator's mouse happens
+#    to be passing over (DataTable rows in the run list, the focused
+#    ``RichLog`` in the detail view). The operator explicitly didn't
+#    want that.
+#
+# Disabling mouse mode delegates click-and-drag back to the terminal:
+# native selection works, the terminal's own copy gesture
+# (``Cmd+C`` / ``Ctrl+Shift+C`` / right-click → Copy, depending on
+# emulator) puts the bytes on the system clipboard, and ``:hover``
+# never fires. The trade-off is the loss of mouse-wheel scrolling and
+# click-to-focus inside the TUI, which is acceptable here because every
+# operator action already has a keyboard binding (``j``/``k``/``g``/
+# ``G``/``f`` for the log viewer; the single-letter verbs documented
+# in :class:`RunListScreen.BINDINGS` for the run list).
+_TUI_MOUSE = False
+
+
 def run_list_app(runs_dir: Path) -> int:
     """Launch the run-list TUI. Returns a CLI exit code."""
     app = RunListApp(runs_dir)
-    app.run()
+    app.run(mouse=_TUI_MOUSE)
     return 0
 
 
@@ -1830,7 +1867,7 @@ def run_detail_app(
         refresh_seconds=refresh_seconds,
         initial_log_lines=initial_log_lines,
     )
-    app.run()
+    app.run(mouse=_TUI_MOUSE)
     return 0
 
 
