@@ -430,6 +430,39 @@ def tail_text_file_with_offset(
     return out[-max(1, lines) :], end_offset
 
 
+def read_text_file_with_offset(path: Path) -> Tuple[list[str], int]:
+    """Read *path* in full and return ``(all_lines, end_offset)``.
+
+    Sister of :func:`tail_text_file_with_offset` for callers that want
+    the *full* transcript dumped to scrollback rather than a bounded
+    tail. ``end_offset`` is captured in the same ``open`` so a
+    follow-up :class:`LogTailer` parked at that offset (via
+    :meth:`LogTailer.seek_to`) sees only future appends — closing the
+    same race window between the seed read and the tailer hand-off
+    that :func:`tail_text_file_with_offset` was written to close.
+
+    Returns ``([], 0)`` for a missing or unreadable file. An empty
+    file returns ``([], 0)`` as well so callers don't have to special
+    case "file exists but is empty".
+
+    Used by :func:`stream_log` when the operator opens a run from the
+    interactive run-list TUI: the whole point of native-scrollback
+    streaming is that the local terminal owns navigation, and that's
+    only useful if the *whole* transcript has been written into the
+    scrollback in the first place. A bounded seed would silently
+    truncate everything older than the last N lines."""
+    try:
+        with path.open("rb") as f:
+            data = f.read()
+            end_offset = f.tell()
+    except OSError:
+        return [], 0
+    if not data:
+        return [], end_offset
+    text = data.decode("utf-8", errors="replace")
+    return text.splitlines(), end_offset
+
+
 def tail_text_file(
     path: Path,
     *,
@@ -750,7 +783,7 @@ def run_live_show(
 def stream_log(
     paths: RunPaths,
     *,
-    log_lines: int = 30,
+    log_lines: Optional[int] = 30,
     poll_seconds: float = 0.4,
     out=None,
     sleep: Callable[[float], None] = time.sleep,
@@ -777,9 +810,16 @@ def stream_log(
 
     1. **Status header** — one snapshot of the labelled status block
        so the operator has context for the run they're tailing.
-    2. **Seed tail** — last ``log_lines`` lines of ``logs/agent.log``
-       so recent context shows up immediately rather than waiting for
-       the next agent write.
+    2. **Seed body** — either the *full* transcript (when
+       ``log_lines is None``) or the last ``log_lines`` lines of
+       ``logs/agent.log``. The full-transcript mode is what the
+       interactive run-list TUI hands off to: the operator pressed
+       Enter on a run because they want to see the whole history,
+       and writing it all to the regular screen buffer is what
+       makes the local terminal's scrollback useful in the first
+       place. ``log_lines=N`` keeps the bounded behaviour for
+       callers like ``ai show --stream`` where surfacing a few
+       MiB of historical bytes per tab open would be wasteful.
 
     After the seed, the function enters a poll loop that surfaces new
     appends via :class:`LogTailer` and writes them straight to *out*
@@ -801,13 +841,16 @@ def stream_log(
         except (AttributeError, OSError):
             pass
 
+    full_log = log_lines is None
+
     for line in _status_section_lines(paths):
         out.write(line + "\n")
     out.write("\n")
+    seed_label = "full transcript" if full_log else f"last {int(log_lines)}"
     out.write(
         f"{BOLD}Agent output{NC}  "
         f"{DIM}(streaming · Ctrl-C to exit · "
-        f"native terminal scrollback){NC}\n"
+        f"native terminal scrollback · {seed_label}){NC}\n"
     )
 
     # Read the seed and capture the EOF offset in a single ``open`` so
@@ -817,11 +860,19 @@ def stream_log(
     # the seed nor surfaced by the tailer — exactly the lines an
     # operator opening ``--stream`` would most want to see. See
     # :func:`tail_text_file_with_offset` for the race analysis.
+    # ``read_text_file_with_offset`` shares the same one-open-handle
+    # contract for the full-dump path so the race-window is closed
+    # whether we seed N lines or the entire file.
     seed_end_offset = 0
     if paths.agent_log.exists():
-        seed, seed_end_offset = tail_text_file_with_offset(
-            paths.agent_log, lines=max(1, int(log_lines)),
-        )
+        if full_log:
+            seed, seed_end_offset = read_text_file_with_offset(
+                paths.agent_log,
+            )
+        else:
+            seed, seed_end_offset = tail_text_file_with_offset(
+                paths.agent_log, lines=max(1, int(log_lines)),
+            )
         if not seed:
             out.write(f"{DIM}(agent has not produced output yet){NC}\n")
         else:
@@ -1040,6 +1091,7 @@ class LogTailer:
 __all__ = [
     "LogTailer",
     "fit_section_caps",
+    "read_text_file_with_offset",
     "render_status_view",
     "render_event",
     "render_events",

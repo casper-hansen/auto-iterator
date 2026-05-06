@@ -578,6 +578,16 @@ def test_bare_ai_enter_on_run_routes_to_stream_log(
         "high-latency-SSH lag the redesign exists to fix."
     )
     assert captured["paths"].run_id == paths.run_id
+    # The handoff must request the *full* transcript (log_lines=None)
+    # rather than a bounded tail. A bounded seed silently truncates
+    # anything older than the cap, leaving the operator unable to
+    # scroll back to the rest of the log — the local terminal's
+    # scrollback can only show what was actually written to it.
+    assert captured["log_lines"] is None, (
+        "Enter on a run must seed the full transcript, not a tail; "
+        "otherwise the operator cannot see the full log via native "
+        "scrollback once the alt-screen TUI tears down."
+    )
 
 
 def test_bare_ai_quit_without_selection_does_not_call_stream_log(

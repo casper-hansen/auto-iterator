@@ -222,6 +222,109 @@ def test_stream_log_respects_log_lines_cap(tmp_path) -> None:
         )
 
 
+def test_stream_log_log_lines_none_dumps_full_transcript(tmp_path) -> None:
+    """``log_lines=None`` is the "operator picked a run from the TUI"
+    contract: dump the *entire* agent transcript so the local
+    terminal's native scrollback owns the full history.
+
+    Anything less defeats the whole point of native-scrollback
+    streaming for an interactive picker: bytes older than the cap
+    are no longer reachable once the alt-screen TUI tears down,
+    and the operator's "I cannot see the full log" complaint maps
+    to exactly that truncation."""
+    body = "\n".join(f"line-{i:04d}" for i in range(1_000)) + "\n"
+    paths = _seed_run(tmp_path, agent_log_text=body)
+
+    out = io.StringIO()
+    rc = stream_log(
+        paths,
+        log_lines=None,
+        out=out,
+        sleep=_FakeClock(),
+        should_continue=lambda i: False,
+    )
+
+    assert rc == 0
+    text = out.getvalue()
+    # Sample across the whole range — first, middle, last lines must
+    # all be present in the dumped transcript.
+    for i in (0, 1, 250, 500, 750, 998, 999):
+        assert f"line-{i:04d}" in text, (
+            f"line-{i:04d} must appear when log_lines=None dumps the "
+            f"full transcript (operator selected this run from the "
+            f"interactive picker and expects to see *everything*)"
+        )
+    # The header must label the seed mode so the operator knows
+    # they're looking at the full file rather than a tail.
+    assert "full transcript" in text
+
+
+def test_stream_log_full_dump_then_streams_appends(tmp_path) -> None:
+    """After dumping the full transcript, subsequent agent writes must
+    still surface — and the seed must not be re-emitted.
+
+    This is the same race-window contract as the bounded-seed path:
+    :func:`read_text_file_with_offset` returns the EOF observed
+    during the dump so the tailer can be parked exactly past the
+    last seed byte. A naive implementation that re-``stat()``s the
+    file would either drop bytes (offset moved forward) or
+    double-emit them (offset rewound)."""
+    body = "\n".join(f"seed-{i:03d}" for i in range(50)) + "\n"
+    paths = _seed_run(tmp_path, agent_log_text=body)
+
+    iters = {"n": 0}
+
+    def driver(_seconds: float) -> None:
+        iters["n"] += 1
+        if iters["n"] == 1:
+            with paths.agent_log.open("a", encoding="utf-8") as fh:
+                fh.write("APPEND-AFTER-DUMP\n")
+
+    out = io.StringIO()
+    rc = stream_log(
+        paths,
+        log_lines=None,
+        out=out,
+        sleep=driver,
+        should_continue=lambda i: i < 3,
+    )
+
+    assert rc == 0
+    text = out.getvalue()
+    assert "APPEND-AFTER-DUMP" in text
+    # Each seed line should appear exactly once — no double-emit
+    # caused by the tailer re-reading bytes the dump already
+    # surfaced.
+    for i in (0, 25, 49):
+        assert text.count(f"seed-{i:03d}") == 1, (
+            f"seed-{i:03d} must appear exactly once; double-emission "
+            f"would mean the tailer was anchored before the dump's EOF"
+        )
+    assert text.count("APPEND-AFTER-DUMP") == 1
+
+
+def test_stream_log_full_dump_handles_missing_log(tmp_path) -> None:
+    """``log_lines=None`` against a run that has not yet produced any
+    agent output must still print the header + placeholder rather
+    than crashing on the missing file."""
+    paths = _seed_run(tmp_path)
+    assert not paths.agent_log.exists()
+
+    out = io.StringIO()
+    rc = stream_log(
+        paths,
+        log_lines=None,
+        out=out,
+        sleep=_FakeClock(),
+        should_continue=lambda i: False,
+    )
+
+    assert rc == 0
+    text = out.getvalue()
+    assert "full transcript" in text
+    assert "agent has not produced output yet" in text
+
+
 def test_stream_log_does_not_drop_lines_appended_during_seed(
     tmp_path, monkeypatch,
 ) -> None:
@@ -358,6 +461,46 @@ def test_tail_text_file_with_offset_missing_or_empty(tmp_path) -> None:
     empty = tmp_path / "empty.log"
     empty.write_bytes(b"")
     assert tail_text_file_with_offset(empty, lines=5) == ([], 0)
+
+
+def test_read_text_file_with_offset_returns_eof_position(tmp_path) -> None:
+    """``read_text_file_with_offset`` must report the same EOF position
+    that :class:`LogTailer` should be parked at to surface only future
+    appends. Same race-free hand-off contract as
+    :func:`tail_text_file_with_offset`, but for the *full* dump path
+    the run-list TUI hand-off uses."""
+    from auto_iterator.display import LogTailer, read_text_file_with_offset
+
+    log = tmp_path / "agent.log"
+    body = "alpha\nbeta\ngamma\n"
+    log.write_text(body, encoding="utf-8")
+
+    lines, end = read_text_file_with_offset(log)
+    assert lines == ["alpha", "beta", "gamma"]
+    assert end == len(body.encode("utf-8"))
+
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write("delta\n")
+    tailer = LogTailer(log)
+    tailer.seek_to(end)
+    assert tailer.read_new_lines() == ["delta"], (
+        "an append after the full dump must surface via the tailer "
+        "exactly once, with no overlap or gap"
+    )
+
+
+def test_read_text_file_with_offset_missing_or_empty(tmp_path) -> None:
+    """Missing and empty files yield ``([], <offset>)`` so callers can
+    safely seed a tailer without special-casing. The offset is 0 for
+    both — there are no bytes to skip past."""
+    from auto_iterator.display import read_text_file_with_offset
+
+    missing = tmp_path / "nope.log"
+    assert read_text_file_with_offset(missing) == ([], 0)
+
+    empty = tmp_path / "empty.log"
+    empty.write_bytes(b"")
+    assert read_text_file_with_offset(empty) == ([], 0)
 
 
 def test_logtailer_seek_to_clamps_negative(tmp_path) -> None:

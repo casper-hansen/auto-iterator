@@ -1245,14 +1245,20 @@ def cmd_tui(_args: argparse.Namespace, runs_dir: Path) -> int:
     if selection is None:
         return rc
     # Operator picked a run from the list. Drop into the streaming
-    # tail on the regular screen buffer; we deliberately use a
-    # generous default ``log_lines`` so the operator sees plenty of
-    # recent transcript context immediately, matching what the old
-    # pyratatui detail screen seeded with.
+    # tail on the regular screen buffer with ``log_lines=None`` so
+    # the *entire* transcript is dumped into the local terminal's
+    # scrollback. Anything less truncates older history that's no
+    # longer reachable once the alt-screen TUI tears down — the
+    # whole point of native-scrollback streaming is that the local
+    # terminal owns navigation, and that's only useful if the bytes
+    # you want to scroll back to were actually written there. A
+    # bounded seed (we used to pass ``log_lines=200``) silently
+    # hides anything older than the cap, which matches the
+    # operator's "I cannot see the full log" complaint exactly.
     from .display import stream_log
     return stream_log(
         selection,
-        log_lines=200,
+        log_lines=None,
         poll_seconds=0.4,
     )
 
