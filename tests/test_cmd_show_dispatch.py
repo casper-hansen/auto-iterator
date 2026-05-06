@@ -225,6 +225,141 @@ def test_show_logs_alias_behaves_like_once(capsys, monkeypatch) -> None:
     assert "pyratatui" not in sys.modules
 
 
+# ── --stream path ──────────────────────────────────────────────────────────
+
+
+def test_show_stream_calls_stream_log_without_importing_tui(
+    capsys, monkeypatch,
+) -> None:
+    """``ai show --stream`` is the SSH-friendly tail mode.
+
+    Two contracts pinned here:
+
+    1. **No pyratatui.** ``--stream`` exists *because* the TUI is too
+       chatty over high-latency links; importing it would defeat the
+       cold-start argument.
+    2. **Routes to ``stream_log``.** The CLI must hand off to
+       :func:`auto_iterator.display.stream_log` with the operator's
+       ``--log-lines`` / ``--refresh`` arguments rather than falling
+       back to the one-shot ``render_combined_view``.
+
+    We force ``stdout.isatty()`` to ``True`` so the dispatcher can't
+    short-circuit into the non-TTY ``--once`` branch — the whole
+    point of ``--stream`` is that it overrides the TTY default.
+    """
+    _drop_tui_modules_from_sys_modules()
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    captured: dict = {}
+
+    def fake_stream(paths, *, log_lines, poll_seconds):
+        captured["paths"] = paths
+        captured["log_lines"] = log_lines
+        captured["poll_seconds"] = poll_seconds
+        return EXIT_OK
+
+    from auto_iterator import display as _display
+
+    monkeypatch.setattr(_display, "stream_log", fake_stream, raising=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run(Path(tmp))
+        rc = main([
+            "--runs-dir", tmp, "show", paths.run_id,
+            "--stream", "--log-lines", "42", "--refresh", "0.25",
+        ])
+        assert rc == EXIT_OK
+
+    assert captured.get("paths") is not None, (
+        "ai show --stream must route through display.stream_log"
+    )
+    assert captured["log_lines"] == 42
+    assert abs(captured["poll_seconds"] - 0.25) < 1e-6
+
+    assert "pyratatui" not in sys.modules, (
+        "ai show --stream must not import pyratatui (that's the "
+        "cold-start contract --stream exists to preserve over "
+        "high-latency SSH); sys.modules contains: "
+        f"{[k for k in sys.modules if 'pyratatui' in k]}"
+    )
+
+
+def test_show_stream_overrides_non_tty_fallback(capsys, monkeypatch) -> None:
+    """``--stream`` with stdout *not* a TTY still follows.
+
+    The dispatcher's non-TTY heuristic exists so a bare ``ai show <id>``
+    piped through ``grep`` produces a single snapshot. But an explicit
+    ``--stream`` is the operator saying "follow this, like ``tail -f``"
+    — and ``tail -f`` follows even when piped. So ``--stream`` must
+    take precedence over the non-TTY → ``--once`` fallback."""
+    _drop_tui_modules_from_sys_modules()
+    # Pytest's capsys gives us a non-TTY stdout already; assert it.
+    assert not sys.stdout.isatty()
+
+    routed = {"stream": False, "once": False}
+
+    def fake_stream(paths, *, log_lines, poll_seconds):
+        routed["stream"] = True
+        return EXIT_OK
+
+    def fake_render(paths, *, event_lines, log_lines):
+        routed["once"] = True
+        return ""
+
+    from auto_iterator import display as _display
+
+    monkeypatch.setattr(_display, "stream_log", fake_stream, raising=True)
+    monkeypatch.setattr(_display, "render_combined_view", fake_render,
+                        raising=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run(Path(tmp))
+        rc = main([
+            "--runs-dir", tmp, "show", paths.run_id, "--stream",
+        ])
+        assert rc == EXIT_OK
+
+    assert routed["stream"] is True, (
+        "ai show --stream on non-TTY must call stream_log, not "
+        "fall back to render_combined_view (--once)"
+    )
+    assert routed["once"] is False
+
+
+def test_show_once_beats_stream(capsys, monkeypatch) -> None:
+    """If the operator passes both ``--once`` and ``--stream``, ``--once``
+    wins. A single snapshot is the more conservative interpretation —
+    we don't want to silently turn a one-shot into a long-running
+    follow loop just because both flags landed in muscle memory."""
+    _drop_tui_modules_from_sys_modules()
+
+    routed = {"stream": False, "once": False}
+
+    def fake_stream(paths, *, log_lines, poll_seconds):
+        routed["stream"] = True
+        return EXIT_OK
+
+    def fake_render(paths, *, event_lines, log_lines):
+        routed["once"] = True
+        return ""
+
+    from auto_iterator import display as _display
+
+    monkeypatch.setattr(_display, "stream_log", fake_stream, raising=True)
+    monkeypatch.setattr(_display, "render_combined_view", fake_render,
+                        raising=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run(Path(tmp))
+        rc = main([
+            "--runs-dir", tmp, "show", paths.run_id, "--once", "--stream",
+        ])
+        assert rc == EXIT_OK
+
+    assert routed["once"] is True
+    assert routed["stream"] is False
+
+
 # ── non-TTY default ────────────────────────────────────────────────────────
 
 
@@ -258,17 +393,80 @@ def test_show_non_tty_default_falls_back_to_once(capsys, monkeypatch) -> None:
     )
 
 
-# ── TTY default → pyratatui TUI ────────────────────────────────────────────
+# ── TTY default → streaming tail (no pyratatui) ────────────────────────────
 
 
-def test_show_tty_default_lazy_imports_tui(capsys, monkeypatch) -> None:
-    """When stdout is a TTY, ``ai show`` lazy-imports the TUI entry point.
+def test_show_tty_default_routes_to_stream_log(capsys, monkeypatch) -> None:
+    """When stdout is a TTY, ``ai show <run_id>`` defaults to streaming.
 
-    We don't actually run the TUI — that would block on stdin — we
-    only assert the dispatch path *would* land at
-    :func:`auto_iterator.tui.run_detail_app`. Pinning the symbol with
-    ``monkeypatch`` lets us return a sentinel without spinning up the
-    pyratatui native binding.
+    The high-latency-SSH redesign deliberately moves scrolling from
+    pyratatui's frame loop (where every ``j``/``k``/PageUp/wheel key
+    is a server round-trip) to the local terminal's native
+    scrollback (zero-latency, client-side). For that to actually
+    matter, the streaming tail has to be the **default** path, not
+    an opt-in flag — otherwise muscle memory and tutorials still
+    push operators into the laggy in-process detail TUI.
+
+    Two contracts pinned here:
+
+    1. **Routes to ``stream_log``.** A bare ``ai show <run_id>`` in a
+       TTY hands off to :func:`auto_iterator.display.stream_log`
+       with the operator's ``--log-lines`` / ``--refresh`` arguments.
+    2. **No pyratatui.** Since streaming is now the default, the
+       cold-start cost story applies to the default path, too: an
+       interactive ``ai show`` must not pull in the native binding.
+    """
+    _drop_tui_modules_from_sys_modules()
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    captured: dict = {}
+
+    def fake_stream(paths, *, log_lines, poll_seconds):
+        captured["paths"] = paths
+        captured["log_lines"] = log_lines
+        captured["poll_seconds"] = poll_seconds
+        return EXIT_OK
+
+    from auto_iterator import display as _display
+
+    monkeypatch.setattr(_display, "stream_log", fake_stream, raising=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run(Path(tmp))
+        rc = main([
+            "--runs-dir", tmp, "show", paths.run_id,
+            "--refresh", "0.25", "--log-lines", "42",
+        ])
+        assert rc == EXIT_OK
+
+    assert captured.get("paths") is not None, (
+        "TTY default must hand off to display.stream_log; the "
+        "in-process pyratatui detail screen is the laggy path the "
+        "redesign exists to avoid as the default."
+    )
+    assert abs(captured["poll_seconds"] - 0.25) < 1e-6
+    assert captured["log_lines"] == 42
+
+    assert "pyratatui" not in sys.modules, (
+        "TTY-default ai show must not import pyratatui; the cold-"
+        "start cost contract that --json / --once / --stream all "
+        "honour now applies to the default path too. "
+        f"sys.modules contains: {[k for k in sys.modules if 'pyratatui' in k]}"
+    )
+
+
+def test_show_tui_flag_opts_into_pyratatui_detail_screen(
+    capsys, monkeypatch,
+) -> None:
+    """``ai show <run_id> --tui`` is the explicit escape hatch back into
+    the pyratatui detail screen.
+
+    Streaming is the default because most operators run auto-iterator
+    over network links where the in-process TUI's per-keystroke
+    round-trip is painful. But on a *local* terminal the in-process
+    TUI is genuinely nice, so we keep it as an opt-in. This test
+    pins that the flag exists and does in fact route to
+    :func:`auto_iterator.tui.run_detail_app`.
     """
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
@@ -280,10 +478,6 @@ def test_show_tty_default_lazy_imports_tui(capsys, monkeypatch) -> None:
         sentinel_called["log_lines"] = initial_log_lines
         return EXIT_OK
 
-    # Patch on the ``tui`` module so the lazy import inside
-    # ``cmd_show`` resolves to our fake. We don't drop ``pyratatui``
-    # from sys.modules here — this test *expects* the lazy import to
-    # happen, and patching the symbol is enough to keep it cheap.
     import auto_iterator.tui as _tui
 
     monkeypatch.setattr(_tui, "run_detail_app", fake_run, raising=True)
@@ -291,11 +485,139 @@ def test_show_tty_default_lazy_imports_tui(capsys, monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         paths = _seed_run(Path(tmp))
         rc = main([
-            "--runs-dir", tmp, "show", paths.run_id,
+            "--runs-dir", tmp, "show", paths.run_id, "--tui",
             "--refresh", "0.25", "--log-lines", "42",
         ])
         assert rc == EXIT_OK
 
-    assert sentinel_called.get("paths") is not None
+    assert sentinel_called.get("paths") is not None, (
+        "ai show --tui must route through tui.run_detail_app"
+    )
     assert abs(sentinel_called["refresh"] - 0.25) < 1e-6
     assert sentinel_called["log_lines"] == 42
+
+
+def test_show_tui_flag_errors_when_stdout_not_tty(
+    capsys, monkeypatch,
+) -> None:
+    """``--tui`` requires an interactive TTY.
+
+    Without one we'd open the alt-screen against a pipe and produce
+    garbage; surface a friendly error instead. Mirrors how
+    ``cmd_tui`` (bare ``ai``) errors out on non-TTY stdout."""
+    # capsys gives a non-TTY stdout already; no monkeypatch needed.
+    assert not sys.stdout.isatty()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run(Path(tmp))
+        rc = main([
+            "--runs-dir", tmp, "show", paths.run_id, "--tui",
+        ])
+        err = capsys.readouterr().err
+        assert rc != EXIT_OK
+        assert "TTY" in err or "tty" in err
+
+
+# ── bare ``ai`` (run-list TUI) → Enter routes to stream_log ─────────────────
+
+
+def test_bare_ai_enter_on_run_routes_to_stream_log(
+    capsys, monkeypatch,
+) -> None:
+    """Bare ``ai`` → Enter on a row drops into the streaming tail.
+
+    The lag story this whole change addresses is that pushing an
+    in-process pyratatui detail screen from the run-list re-routes
+    every scroll keystroke through a network round-trip. The fix is
+    a two-step handoff:
+
+      1. ``RunListApp`` exits cleanly on Enter, surfacing the chosen
+         run via ``app.streamed_run`` (tested in
+         ``tests/test_tui_smoke.py``).
+      2. ``cmd_tui`` reads ``streamed_run`` and dispatches into
+         :func:`auto_iterator.display.stream_log`, which writes plain
+         bytes to the regular screen buffer.
+
+    This test pins step 2: monkey-patch ``run_list_app_with_selection``
+    to short-circuit the live TUI loop and return a selection
+    sentinel, then assert the CLI follows up with a ``stream_log``
+    call against the same paths."""
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    captured: dict = {}
+
+    def fake_stream(paths, *, log_lines, poll_seconds):
+        captured["paths"] = paths
+        captured["log_lines"] = log_lines
+        captured["poll_seconds"] = poll_seconds
+        return EXIT_OK
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run(Path(tmp))
+
+        def fake_list_app(_runs_dir):
+            return EXIT_OK, paths
+
+        import auto_iterator.tui as _tui
+        monkeypatch.setattr(
+            _tui, "run_list_app_with_selection", fake_list_app,
+            raising=True,
+        )
+        from auto_iterator import display as _display
+        monkeypatch.setattr(
+            _display, "stream_log", fake_stream, raising=True,
+        )
+
+        rc = main(["--runs-dir", tmp])
+        assert rc == EXIT_OK
+
+    assert captured.get("paths") is not None, (
+        "Enter on a run from the bare-ai run-list must dispatch "
+        "into display.stream_log; otherwise scroll keystrokes go "
+        "through pyratatui's frame loop and we re-introduce the "
+        "high-latency-SSH lag the redesign exists to fix."
+    )
+    assert captured["paths"].run_id == paths.run_id
+
+
+def test_bare_ai_quit_without_selection_does_not_call_stream_log(
+    capsys, monkeypatch,
+) -> None:
+    """Quitting the run-list TUI without picking a run must NOT then
+    drop into ``stream_log``.
+
+    The handoff trigger is an explicit selection (``streamed_run !=
+    None``); a plain ``q`` / Ctrl-C from the run list returns the
+    operator to the shell. Otherwise a "just exploring runs" exit
+    would silently start tailing whatever happened to be highlighted
+    last."""
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    routed = {"stream": False}
+
+    def fake_stream(paths, *, log_lines, poll_seconds):
+        routed["stream"] = True
+        return EXIT_OK
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _seed_run(Path(tmp))
+
+        def fake_list_app(_runs_dir):
+            return EXIT_OK, None  # operator quit without selecting
+
+        import auto_iterator.tui as _tui
+        monkeypatch.setattr(
+            _tui, "run_list_app_with_selection", fake_list_app,
+            raising=True,
+        )
+        from auto_iterator import display as _display
+        monkeypatch.setattr(
+            _display, "stream_log", fake_stream, raising=True,
+        )
+
+        rc = main(["--runs-dir", tmp])
+        assert rc == EXIT_OK
+
+    assert routed["stream"] is False, (
+        "no selection ⇒ no follow-up stream_log call"
+    )

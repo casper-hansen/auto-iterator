@@ -378,6 +378,23 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Print the combined view once and exit "
                              "(no live refresh). Implied when stdout is "
                              "not a TTY.")
+    show_p.add_argument("--stream", action="store_true",
+                        help="Force the SSH-friendly streaming tail. "
+                             "This is the default for an interactive TTY "
+                             "now; the flag is kept so muscle memory and "
+                             "scripts still work and so it can be used "
+                             "alongside other dispatch flags. The local "
+                             "terminal's native scrollback handles "
+                             "navigation, so mouse-wheel / PageUp / "
+                             "tmux copy-mode all work at zero round-trip. "
+                             "Ctrl-C to exit.")
+    show_p.add_argument("--tui", action="store_true",
+                        help="Opt back into the in-process pyratatui "
+                             "detail screen. Useful for local terminals "
+                             "where round-trip latency is negligible; "
+                             "over high-latency SSH the default streaming "
+                             "mode is much smoother because scrolling is "
+                             "handled client-side.")
     show_p.add_argument("--event-lines", type=int, default=12,
                         help="Recent events to show in the combined view "
                              "(default 12).")
@@ -634,13 +651,23 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
       imports the TUI library.
     * ``--once`` / ``--logs`` → one-shot combined text view. Never
       imports the TUI library.
-    * Non-TTY stdout → same as ``--once``. Never imports the TUI
-      library.
-    * Interactive TTY → opens the per-run pyratatui detail screen.
+    * ``--tui`` → in-process pyratatui detail screen (escape hatch
+      for local terminals where round-trip latency is negligible).
+    * Non-TTY stdout (without ``--stream``) → same as ``--once``.
+      Never imports the TUI library.
+    * Interactive TTY default (or explicit ``--stream``) → header +
+      tail-and-follow on the regular screen buffer so the local
+      terminal's native scrollback owns navigation. This is the
+      default because over even modest network latency the
+      pyratatui frame loop turns scrolling into a server-side
+      round-trip per keystroke; native scrollback dodges that
+      entirely. Never imports the TUI library.
 
-    The TTY path lazy-imports :mod:`auto_iterator.tui` so plain
-    ``ai ls`` / ``ai show --json`` / ``ai show --once`` invocations
-    don't pay the pyratatui native-binding startup cost.
+    The TTY path lazy-imports :mod:`auto_iterator.tui` only when
+    the operator explicitly asks for it via ``--tui``, so plain
+    ``ai ls`` / ``ai show <id>`` / ``ai show --json`` / ``--once`` /
+    ``--stream`` invocations don't pay the pyratatui native-binding
+    startup cost.
     """
     run = _resolve_run(runs_dir, args.run_id)
 
@@ -659,8 +686,11 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
         log_lines = max(1, int(args.lines))
 
     once = bool(getattr(args, "once", False) or getattr(args, "logs", False))
-    if once or not _stdout_is_tty():
+    if once:
         # Byte-identical to today's one-shot output. No pyratatui.
+        # ``--once`` beats every other rendering mode: if the operator
+        # asked for a single snapshot we honour that even when
+        # ``--stream`` / ``--tui`` are also set.
         from .display import render_combined_view
         sys.stdout.write(render_combined_view(
             run.paths,
@@ -669,15 +699,50 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
         ))
         return EXIT_OK
 
+    if getattr(args, "tui", False):
+        # Explicit pyratatui escape hatch. Useful on a *local*
+        # terminal where round-trips don't hurt; on a high-latency
+        # link the operator should prefer the streaming default.
+        if not _stdout_is_tty():
+            print(
+                "error: --tui requires an interactive terminal; "
+                "stdout is not a TTY.",
+                file=sys.stderr,
+            )
+            return EXIT_USER_ERROR
+        refresh = max(0.05, float(getattr(args, "refresh", 0.4) or 0.4))
+        from .tui import run_detail_app
+        return run_detail_app(
+            run.paths,
+            refresh_seconds=refresh,
+            initial_log_lines=log_lines,
+        )
+
+    if not _stdout_is_tty() and not getattr(args, "stream", False):
+        # Same one-shot bytes as ``--once``; the non-TTY heuristic
+        # exists so ``ai show <id> | grep ...`` Just Works. An
+        # explicit ``--stream`` on piped stdout still follows
+        # (``tail -f`` semantics).
+        from .display import render_combined_view
+        sys.stdout.write(render_combined_view(
+            run.paths,
+            event_lines=event_lines,
+            log_lines=log_lines,
+        ))
+        return EXIT_OK
+
+    # TTY default (and explicit ``--stream``) → native-scrollback-
+    # friendly tail. Deliberately bypasses the pyratatui TUI even in
+    # a TTY: the whole point is that scroll input is served by the
+    # local terminal emulator, not by pyratatui's frame loop on the
+    # remote host. Eliminates the per-keystroke round-trip that makes
+    # the in-process TUI feel laggy over SSH.
+    from .display import stream_log
     refresh = max(0.05, float(getattr(args, "refresh", 0.4) or 0.4))
-    # TTY default → pyratatui detail screen. Lazy-imported so the
-    # non-TTY paths above don't pull in the native binding on every
-    # invocation.
-    from .tui import run_detail_app
-    return run_detail_app(
+    return stream_log(
         run.paths,
-        refresh_seconds=refresh,
-        initial_log_lines=log_lines,
+        log_lines=log_lines,
+        poll_seconds=refresh,
     )
 
 
@@ -1156,7 +1221,18 @@ def cmd_tui(_args: argparse.Namespace, runs_dir: Path) -> int:
     TUI is lazy-imported so ``ai ls`` / ``ai show --json`` etc. don't
     pay the pyratatui native-binding startup cost. Returning the
     app's exit code makes Ctrl-C from inside the TUI propagate
-    cleanly through the shell."""
+    cleanly through the shell.
+
+    On Enter-on-row, the run-list TUI exits and we hand off to
+    :func:`auto_iterator.display.stream_log` for the selected run.
+    The reason for the handoff (instead of pushing an in-process
+    detail screen) is the high-latency-SSH lag story: streaming on
+    the regular screen buffer means the local terminal's native
+    scrollback owns navigation, so PageUp / mouse-wheel / tmux
+    copy-mode all work at zero round-trip. Pushing a pyratatui
+    ``RunDetailScreen`` would route every scroll keystroke back to
+    the remote host and re-introduce exactly the lag this change
+    was made to fix."""
     if not _stdout_is_tty():
         print(
             "error: `ai` (no subcommand) opens an interactive TUI; "
@@ -1164,8 +1240,21 @@ def cmd_tui(_args: argparse.Namespace, runs_dir: Path) -> int:
             file=sys.stderr,
         )
         return EXIT_USER_ERROR
-    from .tui import run_list_app
-    return run_list_app(runs_dir)
+    from .tui import run_list_app_with_selection
+    rc, selection = run_list_app_with_selection(runs_dir)
+    if selection is None:
+        return rc
+    # Operator picked a run from the list. Drop into the streaming
+    # tail on the regular screen buffer; we deliberately use a
+    # generous default ``log_lines`` so the operator sees plenty of
+    # recent transcript context immediately, matching what the old
+    # pyratatui detail screen seeded with.
+    from .display import stream_log
+    return stream_log(
+        selection,
+        log_lines=200,
+        poll_seconds=0.4,
+    )
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:

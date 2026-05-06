@@ -370,6 +370,66 @@ def _events_section_lines(paths: RunPaths, *, lines: int) -> list[str]:
 # ── Section: agent output ────────────────────────────────────────────────────
 
 
+def tail_text_file_with_offset(
+    path: Path,
+    *,
+    lines: int = 30,
+    chunk_per_line: int = 4096,
+) -> Tuple[list[str], int]:
+    """Atomic version of :func:`tail_text_file` that also returns the EOF offset.
+
+    Returns a pair ``(tail_lines, end_offset)`` where ``end_offset`` is
+    the byte position in *path* immediately past the bytes consulted
+    to produce ``tail_lines``. A :class:`LogTailer` parked at that
+    offset (via :meth:`LogTailer.seek_to`) will surface only future
+    appends — no overlap, no missed bytes.
+
+    This matters for ``ai show --stream``: a naive implementation that
+    reads the seed via :func:`tail_text_file` and *then* calls
+    :meth:`LogTailer.seek_to_end` introduces a race window. Anything
+    written to ``agent.log`` between the seed read and the second
+    ``stat()`` would land below the tailer's offset and never make it
+    to the operator's terminal — exactly the bytes you most want to
+    see when starting a follow. Doing both reads inside one ``open``
+    closes that window: the tailer starts where the seed stopped.
+
+    Returns ``([], 0)`` for missing or empty files."""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)  # SEEK_END
+            size = f.tell()
+            if size == 0:
+                return [], 0
+            chunk = max(1, lines) * max(64, chunk_per_line)
+            seeked_inside = size > chunk
+            if seeked_inside:
+                f.seek(size - chunk)
+            else:
+                f.seek(0)
+            data = f.read()
+            end_offset = f.tell()
+    except OSError:
+        return [], 0
+    if seeked_inside:
+        # The seek likely landed mid-line, so drop everything up to and
+        # including the first newline in our window. If the window
+        # contains *no* newline at all (e.g. the log is one giant line
+        # that hasn't been flushed with a \n yet, or a single line
+        # longer than ``chunk``), keep the bytes we have rather than
+        # discarding them — the docstring promises a truncated tail in
+        # that case, not an empty result. The dropped bytes were still
+        # *read*, so ``end_offset`` correctly reflects the file
+        # position past them and the tailer won't re-emit them.
+        nl = data.find(b"\n")
+        if nl != -1:
+            data = data[nl + 1 :]
+    text = data.decode("utf-8", errors="replace")
+    out = text.splitlines()
+    if not out:
+        return [], end_offset
+    return out[-max(1, lines) :], end_offset
+
+
 def tail_text_file(
     path: Path,
     *,
@@ -386,39 +446,18 @@ def tail_text_file(
     keeping the reader cheap and bounded.
 
     Returns ``[]`` for a missing or empty file so callers can render a
-    friendly placeholder."""
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return []
-    if size == 0:
-        return []
-    chunk = max(1, lines) * max(64, chunk_per_line)
-    try:
-        with path.open("rb") as f:
-            if size > chunk:
-                f.seek(size - chunk)
-                data = f.read()
-                # The seek likely landed mid-line, so drop everything
-                # up to and including the first newline in our window.
-                # If the window contains *no* newline at all (e.g. the
-                # log is one giant line that hasn't been flushed with a
-                # \n yet, or a single line longer than ``chunk``), keep
-                # the bytes we have rather than discarding them — the
-                # docstring promises a truncated tail in that case, not
-                # an empty result.
-                nl = data.find(b"\n")
-                if nl != -1:
-                    data = data[nl + 1 :]
-            else:
-                data = f.read()
-    except OSError:
-        return []
-    text = data.decode("utf-8", errors="replace")
-    out = text.splitlines()
-    if not out:
-        return []
-    return out[-max(1, lines) :]
+    friendly placeholder.
+
+    Callers that also need to start tailing from where this read
+    stopped should use :func:`tail_text_file_with_offset` directly so
+    the seed read and the follow handoff share a single file handle
+    (closing the race window between ``stat()`` and the tailer's
+    offset). This wrapper is kept for the many existing callers that
+    only care about the lines."""
+    out, _ = tail_text_file_with_offset(
+        path, lines=lines, chunk_per_line=chunk_per_line,
+    )
+    return out
 
 
 def _agent_output_section_lines(paths: RunPaths, *, lines: int) -> list[str]:
@@ -705,6 +744,116 @@ def run_live_show(
     return 0
 
 
+# ── Streaming tail (native-scrollback friendly) ─────────────────────────────
+
+
+def stream_log(
+    paths: RunPaths,
+    *,
+    log_lines: int = 30,
+    poll_seconds: float = 0.4,
+    out=None,
+    sleep: Callable[[float], None] = time.sleep,
+    should_continue: Optional[Callable[[int], bool]] = None,
+) -> int:
+    """Tail the agent transcript to stdout without owning the screen.
+
+    The pyratatui detail TUI redraws frames in raw mode + alternate
+    screen, which means every keystroke (``j``/``k``/PageUp/PageDown,
+    even mouse wheel) is consumed server-side and the resulting frame
+    diff has to ride one network round-trip back to the operator. Over
+    a high-latency SSH link to the auto-iterator host that loop is
+    visible — scrolling feels like wading through molasses.
+
+    The streaming mode trades the live UI for the local terminal's
+    *native* scrollback. Output is plain text written to the regular
+    screen buffer (no ``\\033[?1049h``, no cursor games). Mouse-wheel,
+    Shift+PageUp, tmux's copy-mode, ``less`` piping, etc. all then
+    work entirely client-side at zero latency: bytes have already been
+    delivered to the local emulator's scrollback, and navigating that
+    buffer never touches the remote host.
+
+    Layout (top → bottom, all printed once at start):
+
+    1. **Status header** — one snapshot of the labelled status block
+       so the operator has context for the run they're tailing.
+    2. **Seed tail** — last ``log_lines`` lines of ``logs/agent.log``
+       so recent context shows up immediately rather than waiting for
+       the next agent write.
+
+    After the seed, the function enters a poll loop that surfaces new
+    appends via :class:`LogTailer` and writes them straight to *out*
+    as they arrive. Lines are flushed eagerly so a pipe into ``less``
+    or ``grep`` sees output in real time rather than block-buffered.
+
+    Exits cleanly on ``KeyboardInterrupt`` (Ctrl-C). Returns ``0``.
+
+    The ``should_continue`` / ``sleep`` hooks are test affordances
+    matching :func:`run_live_show`: they let unit tests drive the
+    loop deterministically without a real wall clock or terminal.
+    """
+    if out is None:
+        out = sys.stdout
+
+    def _flush() -> None:
+        try:
+            out.flush()
+        except (AttributeError, OSError):
+            pass
+
+    for line in _status_section_lines(paths):
+        out.write(line + "\n")
+    out.write("\n")
+    out.write(
+        f"{BOLD}Agent output{NC}  "
+        f"{DIM}(streaming · Ctrl-C to exit · "
+        f"native terminal scrollback){NC}\n"
+    )
+
+    # Read the seed and capture the EOF offset in a single ``open`` so
+    # the tailer can be anchored exactly past the last seed byte. If we
+    # instead read the seed and then ``stat()``-ed the file again,
+    # bytes appended between the two operations would be neither in
+    # the seed nor surfaced by the tailer — exactly the lines an
+    # operator opening ``--stream`` would most want to see. See
+    # :func:`tail_text_file_with_offset` for the race analysis.
+    seed_end_offset = 0
+    if paths.agent_log.exists():
+        seed, seed_end_offset = tail_text_file_with_offset(
+            paths.agent_log, lines=max(1, int(log_lines)),
+        )
+        if not seed:
+            out.write(f"{DIM}(agent has not produced output yet){NC}\n")
+        else:
+            for raw in seed:
+                out.write(raw.rstrip("\r") + "\n")
+    else:
+        out.write(f"{DIM}(agent has not produced output yet){NC}\n")
+    _flush()
+
+    tailer = LogTailer(paths.agent_log)
+    tailer.seek_to(seed_end_offset)
+
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            new_lines = tailer.read_new_lines()
+            if new_lines:
+                for raw in new_lines:
+                    out.write(raw.rstrip("\r") + "\n")
+                _flush()
+            if should_continue is not None and not should_continue(iteration):
+                break
+            try:
+                sleep(max(0.05, float(poll_seconds)))
+            except KeyboardInterrupt:
+                break
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 # ── State JSON helpers (kept here so ``--json`` paths share a formatter) ──────
 
 
@@ -787,7 +936,16 @@ class LogTailer:
         seed was responsible for rendering, not to a future write.
 
         Returns the new offset (== ``st_size`` if the file exists, ``0``
-        otherwise) so callers can assert in tests."""
+        otherwise) so callers can assert in tests.
+
+        Note: there is a small race window between the seed read in
+        the TUI panel and this ``stat()`` — anything written in
+        between is silently dropped. The pyratatui panel polls at
+        ~5 Hz so a missed line is recovered visually on the next
+        tick (the seed is re-rendered on every refresh anyway), but
+        callers like :func:`stream_log` that *only* render once
+        should prefer :meth:`seek_to` with the offset returned by
+        :func:`tail_text_file_with_offset`."""
         try:
             size = self.path.stat().st_size
         except OSError:
@@ -797,6 +955,25 @@ class LogTailer:
         self._offset = size
         self._partial = b""
         return size
+
+    def seek_to(self, offset: int) -> int:
+        """Park the cached offset at exactly *offset* bytes into the file.
+
+        Unlike :meth:`seek_to_end`, this does not consult ``stat()`` —
+        the caller is asserting "I know precisely how many bytes of
+        this file I have already consumed; surface anything past that
+        on the next read." Used by the streaming tail
+        (:func:`stream_log`) which gets *both* the seed lines and the
+        EOF offset from one call to :func:`tail_text_file_with_offset`,
+        so there is no window where appends can slip through unseen.
+
+        Negative offsets are clamped to zero (treated as "rewind to the
+        start") so a buggy caller can't make the tailer seek past EOF
+        on the next ``read_new_lines``. Also clears the partial-line
+        buffer for the same reason :meth:`seek_to_end` does."""
+        self._offset = max(0, int(offset))
+        self._partial = b""
+        return self._offset
 
     @property
     def offset(self) -> int:
@@ -869,5 +1046,7 @@ __all__ = [
     "render_combined_view",
     "run_live_show",
     "state_json_text",
+    "stream_log",
     "tail_text_file",
+    "tail_text_file_with_offset",
 ]

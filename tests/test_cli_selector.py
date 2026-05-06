@@ -1252,22 +1252,24 @@ def test_display_run_live_show_no_line_exceeds_columns() -> None:
 def test_main_show_keyboard_interrupt_exits_zero(capsys, monkeypatch) -> None:
     """Top-level ``ai show`` swallows KeyboardInterrupt with exit 0.
 
-    Forces the TUI path by pinning ``sys.stdout.isatty`` to True, then
-    monkeypatches the lazy import so the pyratatui app entry point
-    raises :class:`KeyboardInterrupt`. The wrapper in
+    Forces the TTY path by pinning ``sys.stdout.isatty`` to True. The
+    TTY default now hands off to :func:`auto_iterator.display.stream_log`
+    (the SSH-friendly streaming tail) rather than the in-process
+    pyratatui detail screen, so we monkeypatch ``stream_log`` to
+    raise :class:`KeyboardInterrupt`. The wrapper in
     :func:`auto_iterator.cli.main` is the last line of defence against
     a Ctrl-C in the live loop turning into a noisy traceback."""
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
-    def fake_app(*_args, **_kwargs):
+    def fake_stream(*_args, **_kwargs):
         raise KeyboardInterrupt
 
-    # ``cmd_show`` lazy-imports ``auto_iterator.tui`` and calls
-    # ``run_detail_app``; patch the symbol on the module so the lazy
-    # import sees our fake.
-    import auto_iterator.tui as _tui
+    # ``cmd_show`` (TTY default) imports ``stream_log`` from
+    # :mod:`auto_iterator.display`. Patch the symbol on the module so
+    # the import sees our fake.
+    from auto_iterator import display as _display
 
-    monkeypatch.setattr(_tui, "run_detail_app", fake_app, raising=True)
+    monkeypatch.setattr(_display, "stream_log", fake_stream, raising=True)
     with tempfile.TemporaryDirectory() as tmp:
         paths = _seed_run(Path(tmp))
         rc = main(["--runs-dir", tmp, "show", paths.run_id])

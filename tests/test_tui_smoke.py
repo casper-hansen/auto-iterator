@@ -153,8 +153,22 @@ def test_run_list_renders_one_row_per_run():
         assert {r.run_id for r in screen.rows} == {r.run_id for r in rows}
 
 
-def test_pressing_enter_pushes_detail_screen():
-    """Selecting a row opens :class:`RunDetailScreen`."""
+def test_pressing_enter_exits_run_list_with_streamed_run_set():
+    """Selecting a row exits the run-list TUI and surfaces the chosen run.
+
+    The high-latency-SSH redesign moved navigation off the pyratatui
+    frame loop and onto the local terminal's native scrollback.
+    Pushing an in-process ``RunDetailScreen`` from the run-list
+    would re-introduce the laggy path: every PageUp / mouse-wheel
+    keystroke would round-trip back to the runner host, which is
+    exactly the symptom the redesign exists to remove.
+
+    The new contract: pressing Enter on a row sets
+    ``app.streamed_run`` and exits the app. The CLI (``cmd_tui``)
+    inspects that field and hands off to
+    :func:`auto_iterator.display.stream_log`, which writes plain
+    bytes to the regular screen buffer so the terminal's native
+    scrollback owns navigation."""
     with tempfile.TemporaryDirectory() as tmp:
         runs_dir = Path(tmp)
         paths = _seed_run_dir(runs_dir)
@@ -165,26 +179,33 @@ def test_pressing_enter_pushes_detail_screen():
             app = RunListApp(runs_dir)
             _press(app, "Enter")
 
-        assert isinstance(app.screen, RunDetailScreen)
-        assert app.screen.paths.run_id == paths.run_id
+        assert app.screen is None, (
+            "pressing Enter must tear the run-list TUI down so the "
+            "alt-screen is restored before the streaming tail "
+            "starts; otherwise the tail's bytes land inside an alt-"
+            "screen that won't survive in the terminal's native "
+            "scrollback."
+        )
+        assert app.streamed_run is not None, (
+            "Enter must surface the chosen run via app.streamed_run "
+            "so cmd_tui can dispatch into stream_log"
+        )
+        assert app.streamed_run.run_id == paths.run_id
 
 
-def test_pressing_enter_seeds_full_agent_log():
-    """The press-Enter path seeds the *entire* existing transcript.
+def test_pressing_enter_does_not_construct_run_detail_screen():
+    """Enter must NOT mount a pyratatui ``RunDetailScreen``.
 
-    Reviewer pin: the run-list pushes ``RunDetailScreen(paths,
-    initial_log_lines=None)`` so older log lines stay scrollable
-    rather than being permanently absent. We seed with 200 lines (well
-    above the previous 30-line cap) and assert that every single one
-    is rendered into the buffer."""
+    Defensive against a regression where someone re-adds the old
+    ``self.push_screen(RunDetailScreen(...))`` line inside
+    ``_AppBase._reconcile``: that would push the in-process detail
+    view back into the screen stack and silently re-introduce the
+    laggy SSH path. We assert the screen stack is empty after the
+    Enter, which is only true if the app has exited cleanly with
+    a selection set instead."""
     with tempfile.TemporaryDirectory() as tmp:
         runs_dir = Path(tmp)
         paths = _seed_run_dir(runs_dir)
-        seed_lines = [f"agent line {i:04d}" for i in range(200)]
-        paths.agent_log.write_text(
-            "\n".join(seed_lines) + "\n", encoding="utf-8",
-        )
-
         row = _make_run_row(paths.run_id)
         with mock.patch(
             "auto_iterator.tui.list_runs", return_value=[row],
@@ -192,18 +213,17 @@ def test_pressing_enter_seeds_full_agent_log():
             app = RunListApp(runs_dir)
             _press(app, "Enter")
 
-        assert isinstance(app.screen, RunDetailScreen)
-        assert app.screen.initial_log_lines is None, (
-            "press-Enter must request the full transcript, "
-            "not the bounded tail"
+        assert not any(
+            isinstance(s, RunDetailScreen) for s in app.screens
+        ), (
+            "Enter must not push RunDetailScreen onto the app's "
+            "screen stack; the bare-ai → Enter handoff is supposed "
+            "to drop into the streaming tail (native scrollback) "
+            "rather than the in-process pyratatui detail screen."
         )
-        rendered = list(app.screen._lines)
-        assert "agent line 0000" in rendered, (
-            "the head of the log must be visible after Enter"
-        )
-        assert "agent line 0100" in rendered
-        assert "agent line 0199" in rendered, (
-            "the tail of the log must be visible after Enter"
+        assert app.screens == [], (
+            "the app should have exited cleanly so the alt-screen "
+            "is torn down before stream_log writes to stdout"
         )
 
 
@@ -841,24 +861,21 @@ def test_diff_modal_close_pops_overlay():
     assert diff.done is True
 
 
-def test_run_list_renders_status_bar_for_detail_screen_after_open():
-    """After Enter, the detail screen's ``status_text`` is non-empty
-    once :meth:`_refresh_status` has run. Mirrors what the operator
-    sees in the top bar of the per-run view."""
+def test_run_detail_app_renders_status_bar_after_mount():
+    """``RunDetailApp`` populates ``status_text`` once mounted.
+
+    This used to be tested via "press Enter on the run list" because
+    the run-list pushed a ``RunDetailScreen`` on selection. Enter
+    now hands off to the streaming tail instead (so the local
+    terminal's native scrollback owns scrolling), so the contract
+    only applies to the explicit ``ai show <id> --tui`` opt-in.
+    Construct the app directly to keep the contract pinned."""
     with tempfile.TemporaryDirectory() as tmp:
-        runs_dir = Path(tmp)
-        paths = _seed_run_dir(runs_dir)
-        row = _make_run_row(paths.run_id)
-        with mock.patch(
-            "auto_iterator.tui.list_runs", return_value=[row],
-        ):
-            app = RunListApp(runs_dir)
-            _press(app, "Enter")
+        paths = _seed_run_dir(Path(tmp))
+        app = RunDetailApp(paths, refresh_seconds=0.1, initial_log_lines=5)
         screen = app.screen
         assert isinstance(screen, RunDetailScreen)
         assert screen.status_text != "(loading status...)"
-        # Run id always lands in the bar — that's the operator-facing
-        # "which run am I looking at" anchor.
         assert paths.run_id in screen.status_text
 
 

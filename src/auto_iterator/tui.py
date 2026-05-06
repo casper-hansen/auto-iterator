@@ -587,9 +587,11 @@ class RunListScreen:
         self.modals: list[Any] = []
         self.notifications: list[Notification] = []
         # When the operator hits Enter, we hand the App a target
-        # ``RunPaths`` to push a detail screen for. The App reads and
-        # clears this on each tick; reading also resets the field so
-        # multiple Enters don't queue up.
+        # ``RunPaths`` for the run they want to open. The App reads
+        # this on the next tick, exits the run-list TUI cleanly, and
+        # the CLI hands off to the streaming tail (so the local
+        # terminal's native scrollback owns navigation). Reading
+        # resets the field so multiple Enters don't queue up.
         self.pending_detail: Optional[RunPaths] = None
         # Whether the operator pressed ``q``. The App's outer loop
         # treats this as "exit", same as Textual's ``app.exit()``.
@@ -1452,6 +1454,14 @@ class _AppBase:
     def __init__(self) -> None:
         self.screens: list[Any] = []
         self._exited: bool = False
+        # Set when the run-list screen surfaces a "stream this run"
+        # selection (operator hit Enter on a row). The CLI reads this
+        # *after* :meth:`run` returns and dispatches into
+        # :func:`auto_iterator.display.stream_log`, so the local
+        # terminal's native scrollback owns navigation rather than
+        # the pyratatui frame loop. ``None`` means "no follow-up,
+        # plain exit".
+        self.streamed_run: Optional[RunPaths] = None
 
     @property
     def screen(self) -> Any:
@@ -1527,9 +1537,18 @@ class _AppBase:
         pending = getattr(scr, "pending_detail", None)
         if pending is not None:
             scr.pending_detail = None
-            self.push_screen(
-                RunDetailScreen(pending, initial_log_lines=None),
-            )
+            # Hand the selected run to the CLI so it can stream the
+            # transcript on the regular screen buffer. We deliberately
+            # do NOT push a pyratatui ``RunDetailScreen`` here: that
+            # path puts every PageUp / mouse-wheel keystroke through a
+            # network round-trip back to the runner host, which is
+            # exactly the lag this whole change exists to remove.
+            # Instead, exit the app cleanly; the CLI inspects
+            # ``self.streamed_run`` and calls ``stream_log`` so the
+            # local terminal's native scrollback handles navigation.
+            self.streamed_run = pending
+            self._exited = True
+            self.screens.clear()
             return
 
 
@@ -2100,8 +2119,39 @@ def _latest_notification_text(notifications: Iterable[Notification]) -> str:
 
 
 def run_list_app(runs_dir: Path) -> int:
-    """Launch the run-list TUI. Returns a CLI exit code."""
-    return RunListApp(runs_dir).run()
+    """Launch the run-list TUI. Returns a CLI exit code.
+
+    On a clean Enter-on-row selection the run-list TUI now exits and
+    the *caller* is responsible for streaming the chosen run (so the
+    local terminal's native scrollback owns navigation rather than
+    the in-process pyratatui frame loop). For that handoff use
+    :func:`run_list_app_with_selection` instead, which returns both
+    the exit code and the selected ``RunPaths`` (or ``None`` when the
+    operator quit without selecting anything).
+    """
+    rc, _selected = run_list_app_with_selection(runs_dir)
+    return rc
+
+
+def run_list_app_with_selection(
+    runs_dir: Path,
+) -> Tuple[int, Optional[RunPaths]]:
+    """Launch the run-list TUI and report the selection (if any).
+
+    Returns ``(exit_code, paths_or_None)``. ``paths_or_None`` is the
+    ``RunPaths`` the operator selected via Enter on a row; ``None``
+    when they quit (``q`` / Ctrl-C / Esc) without picking a run.
+
+    The CLI uses this two-step shape so a selection cleanly tears
+    down the alt-screen TUI and *then* drops into the streaming tail
+    (:func:`auto_iterator.display.stream_log`). Doing the handoff in
+    two phases — exit, then stream — means the streaming output goes
+    to the regular screen buffer and the local terminal's native
+    scrollback owns it from then on, which is the whole point of the
+    high-latency-SSH redesign."""
+    app = RunListApp(runs_dir)
+    rc = app.run()
+    return rc, app.streamed_run
 
 
 def run_detail_app(
@@ -2131,4 +2181,5 @@ __all__ = [
     "RunListScreen",
     "run_detail_app",
     "run_list_app",
+    "run_list_app_with_selection",
 ]

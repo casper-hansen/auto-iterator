@@ -71,7 +71,16 @@ If worktree creation fails, or the workspace is not a git repository, the runner
 
 ## Operating A Run
 
-`ai show` is the main way to watch a run. In a terminal it shows a live status view with recent structured events and the agent log tail. With `--once`, or when stdout is not a TTY, it prints a single snapshot. `--json` returns the raw `state.json`.
+`ai show` is the main way to watch a run. In an interactive terminal it streams the agent transcript on the regular screen buffer — a header up top, then plain appends as they arrive — so the **local terminal's native scrollback** owns navigation. That's why mouse-wheel, Shift+PageUp, tmux copy-mode and friends all work at zero round-trip even over high-latency SSH: no scroll keystroke has to make it back to the remote host. Press Ctrl-C to exit.
+
+`ai` (no subcommand) opens an interactive run list; pressing Enter on a row exits the list and drops into the same streaming tail for the chosen run, so the no-lag scrollback contract applies there too.
+
+Other modes:
+
+- `--once`, or any non-TTY stdout, prints a single combined snapshot (status + recent events + agent-log tail) and exits.
+- `--json` returns the raw `state.json` for scripting.
+- `--tui` opts back into the in-process pyratatui detail screen. Useful for local terminals where round-trip latency is negligible; over a network link the default streaming mode is much smoother.
+- `--stream` is the explicit form of the new default; kept for muscle memory and so it can be combined with other dispatch flags.
 
 Other operator commands:
 
