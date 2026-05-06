@@ -387,7 +387,7 @@ def _build_parser() -> argparse.ArgumentParser:
                              "terminal's native scrollback handles "
                              "navigation, so mouse-wheel / PageUp / "
                              "tmux copy-mode all work at zero round-trip. "
-                             "Ctrl-C to exit.")
+                             "Esc / q / Ctrl-C to exit.")
     show_p.add_argument("--tui", action="store_true",
                         help="Opt back into the in-process pyratatui "
                              "detail screen. Useful for local terminals "

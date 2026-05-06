@@ -325,6 +325,72 @@ def test_stream_log_full_dump_handles_missing_log(tmp_path) -> None:
     assert "agent has not produced output yet" in text
 
 
+def test_stream_log_exits_when_poll_input_signals(tmp_path) -> None:
+    """A simulated Esc / q keypress (poll_input → True) must break the
+    streaming loop on the next iteration without waiting for Ctrl-C.
+
+    Pins the bug fix for "press Enter on a run from the bare ``ai``
+    TUI, can't get out by pressing Esc": the run-list TUI hands off
+    to ``stream_log`` after Enter, and the streaming view used to
+    only honour Ctrl-C. This contract proves the same loop now
+    short-circuits cleanly on a bare-Esc / q signal."""
+    paths = _seed_run(tmp_path, agent_log_text="alpha\nbeta\n")
+
+    presses = iter([False, False, True])
+
+    def poll() -> bool:
+        try:
+            return next(presses)
+        except StopIteration:
+            return False
+
+    sleeps = _FakeClock()
+    rc = stream_log(
+        paths,
+        log_lines=10,
+        out=io.StringIO(),
+        sleep=sleeps,
+        # ``should_continue`` is a safety net: if the input watcher
+        # fails to break the loop the test would hang forever
+        # otherwise. With the watcher working we should exit *before*
+        # this many iterations are reached.
+        should_continue=lambda i: i < 50,
+        poll_input=poll,
+    )
+
+    assert rc == 0
+    assert len(sleeps.calls) < 5, (
+        "stream_log should break out within a few ticks of the "
+        "first 'exit' poll signal, not run to should_continue's cap"
+    )
+
+
+def test_stream_log_ignores_falsey_poll_input(tmp_path) -> None:
+    """``poll_input`` returning ``False`` for every iteration must NOT
+    cause an early exit — the loop should still respect the
+    ``should_continue`` budget. Pins the inverse of the Esc-exit
+    contract so a no-op watcher (the failure-soft branch when stdin
+    isn't a TTY) doesn't accidentally short-circuit the stream."""
+    paths = _seed_run(tmp_path, agent_log_text="x\n")
+
+    sleeps = _FakeClock()
+    rc = stream_log(
+        paths,
+        log_lines=10,
+        out=io.StringIO(),
+        sleep=sleeps,
+        should_continue=lambda i: i < 4,
+        poll_input=lambda: False,
+    )
+
+    assert rc == 0
+    # Loop ran exactly 4 iterations → at least the 3 between-iteration
+    # sleeps the contract calls for. The exact count is allowed to
+    # drift slightly, but a no-op poll must not collapse the loop to
+    # zero sleeps.
+    assert len(sleeps.calls) >= 3
+
+
 def test_stream_log_does_not_drop_lines_appended_during_seed(
     tmp_path, monkeypatch,
 ) -> None:

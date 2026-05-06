@@ -788,6 +788,7 @@ def stream_log(
     out=None,
     sleep: Callable[[float], None] = time.sleep,
     should_continue: Optional[Callable[[int], bool]] = None,
+    poll_input: Optional[Callable[[], bool]] = None,
 ) -> int:
     """Tail the agent transcript to stdout without owning the screen.
 
@@ -826,11 +827,28 @@ def stream_log(
     as they arrive. Lines are flushed eagerly so a pipe into ``less``
     or ``grep`` sees output in real time rather than block-buffered.
 
-    Exits cleanly on ``KeyboardInterrupt`` (Ctrl-C). Returns ``0``.
+    Exits cleanly on:
 
-    The ``should_continue`` / ``sleep`` hooks are test affordances
-    matching :func:`run_live_show`: they let unit tests drive the
-    loop deterministically without a real wall clock or terminal.
+    * ``KeyboardInterrupt`` (Ctrl-C),
+    * a bare ``Esc`` keypress, or
+    * ``q`` / ``Q``.
+
+    Esc/q parity with Ctrl-C exists because the bare ``ai`` run-list
+    TUI hands off here when an operator presses Enter on a row; the
+    same operator's muscle memory says "Esc backs out of a screen I
+    just opened." Without this, Esc was a dead key and they were
+    stranded in the streaming view until they remembered Ctrl-C. We
+    put ``stdin`` into cbreak (no line buffering, no echo) only when
+    it is a TTY — staying on the regular screen buffer, no
+    alt-screen toggle — so the local terminal's native scrollback
+    remains in charge of mouse-wheel / PageUp navigation. The
+    cbreak setup is restored on every exit path via ``finally``.
+
+    The ``should_continue`` / ``sleep`` / ``poll_input`` hooks are
+    test affordances matching :func:`run_live_show`: they let unit
+    tests drive the loop deterministically without a real wall clock
+    or terminal. ``poll_input`` returning ``True`` means "operator
+    requested exit" and is treated identically to a bare Esc.
     """
     if out is None:
         out = sys.stdout
@@ -849,7 +867,7 @@ def stream_log(
     seed_label = "full transcript" if full_log else f"last {int(log_lines)}"
     out.write(
         f"{BOLD}Agent output{NC}  "
-        f"{DIM}(streaming · Ctrl-C to exit · "
+        f"{DIM}(streaming · Esc / q / Ctrl-C to exit · "
         f"native terminal scrollback · {seed_label}){NC}\n"
     )
 
@@ -885,24 +903,153 @@ def stream_log(
     tailer = LogTailer(paths.agent_log)
     tailer.seek_to(seed_end_offset)
 
+    # Stdin watcher: if stdin is a TTY (operator-driven flow), put it
+    # in cbreak so a single Esc / q keypress reaches us without the
+    # operator pressing Enter. Tests and pipes flow through here with
+    # ``stdin_fd is None`` and the watcher is a no-op — the behaviour
+    # they pin (no alt-screen escapes, deterministic loop via
+    # ``should_continue``) is unchanged. The poll hook lets a unit
+    # test simulate "Esc was pressed at iteration N" without owning a
+    # real PTY.
+    if poll_input is None:
+        poll_input, _restore_input = _make_stdin_exit_watcher()
+    else:
+        _restore_input = lambda: None  # noqa: E731 — caller-supplied hook
+
     iteration = 0
     try:
-        while True:
-            iteration += 1
-            new_lines = tailer.read_new_lines()
-            if new_lines:
-                for raw in new_lines:
-                    out.write(raw.rstrip("\r") + "\n")
-                _flush()
-            if should_continue is not None and not should_continue(iteration):
-                break
-            try:
-                sleep(max(0.05, float(poll_seconds)))
-            except KeyboardInterrupt:
-                break
-    except KeyboardInterrupt:
-        pass
+        try:
+            while True:
+                iteration += 1
+                new_lines = tailer.read_new_lines()
+                if new_lines:
+                    for raw in new_lines:
+                        out.write(raw.rstrip("\r") + "\n")
+                    _flush()
+                if poll_input():
+                    break
+                if should_continue is not None and not should_continue(iteration):
+                    break
+                try:
+                    sleep(max(0.05, float(poll_seconds)))
+                except KeyboardInterrupt:
+                    break
+                if poll_input():
+                    break
+        except KeyboardInterrupt:
+            pass
+    finally:
+        _restore_input()
     return 0
+
+
+def _make_stdin_exit_watcher() -> Tuple[Callable[[], bool], Callable[[], None]]:
+    """Build a ``(poll, restore)`` pair that watches stdin for an exit key.
+
+    ``poll()`` returns ``True`` when the operator pressed a key that
+    means "get me out of the streaming view": a bare ``Esc`` (i.e. an
+    ``ESC`` byte not followed by a CSI/SS3 introducer), or ``q`` /
+    ``Q``. Returns ``False`` otherwise — including when stdin isn't a
+    TTY, ``termios`` isn't available (Windows, IDE consoles), or the
+    cbreak handoff failed. ``restore()`` puts the terminal back into
+    its original line-discipline / echo state and is idempotent.
+
+    Why this is built as a separate helper:
+
+    * **Single responsibility.** ``stream_log`` cares about the
+      streaming poll loop, not termios bookkeeping. Splitting the
+      watcher off keeps each concern testable in isolation and lets
+      a future caller (e.g. a future ``ai logs --tail`` reusing the
+      tailer) reuse the same Esc/q UX.
+    * **Failure-soft.** Anything that goes wrong while reaching for
+      ``termios`` (no controlling terminal, no ``fileno`` on the
+      replacement stdin a test installed, etc.) collapses into a
+      no-op ``poll`` that always returns ``False``, preserving the
+      pre-fix behaviour where Ctrl-C was the only exit. We never
+      want a regression in input handling to make ``stream_log``
+      raise — the streaming view is the operator's last-resort
+      observability surface.
+
+    Bare-Esc detection note: terminal escape sequences (arrow keys,
+    function keys, mouse, …) all start with ``ESC``. We disambiguate
+    by peeking with a short timeout: if no follow-up byte arrives
+    within ~50 ms, it's a bare Esc; otherwise we drain the rest of
+    the sequence and ignore it. 50 ms is comfortably above the
+    inter-byte gap the kernel introduces between ESC and ``[`` even
+    on a slow SSH link, but well below human reaction time, so
+    operator presses register as "exit" rather than as the start of
+    an ignored sequence."""
+    try:
+        import termios
+        import tty
+        import select
+        import os as _os
+    except ImportError:
+        return (lambda: False), (lambda: None)
+
+    stdin = sys.stdin
+    try:
+        if not stdin.isatty():
+            return (lambda: False), (lambda: None)
+        fd = stdin.fileno()
+    except (AttributeError, OSError, ValueError):
+        return (lambda: False), (lambda: None)
+
+    try:
+        original = termios.tcgetattr(fd)
+    except termios.error:
+        return (lambda: False), (lambda: None)
+
+    try:
+        tty.setcbreak(fd, termios.TCSANOW)
+    except termios.error:
+        return (lambda: False), (lambda: None)
+
+    restored = {"done": False}
+
+    def restore() -> None:
+        if restored["done"]:
+            return
+        restored["done"] = True
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, original)
+        except termios.error:
+            pass
+
+    def poll() -> bool:
+        try:
+            ready, _, _ = select.select([fd], [], [], 0)
+        except (OSError, ValueError):
+            return False
+        if not ready:
+            return False
+        try:
+            ch = _os.read(fd, 1)
+        except OSError:
+            return False
+        if not ch:
+            return False
+        if ch in (b"q", b"Q"):
+            return True
+        if ch == b"\x1b":
+            # Could be a bare Esc (exit) or the start of an escape
+            # sequence (arrow keys, F-keys, mouse, …). Peek with a
+            # short timeout: anything that follows is part of a
+            # sequence we should drain and ignore.
+            try:
+                more, _, _ = select.select([fd], [], [], 0.05)
+            except (OSError, ValueError):
+                return True
+            if not more:
+                return True
+            try:
+                _os.read(fd, 1024)
+            except OSError:
+                pass
+            return False
+        return False
+
+    return poll, restore
 
 
 # ── State JSON helpers (kept here so ``--json`` paths share a formatter) ──────
