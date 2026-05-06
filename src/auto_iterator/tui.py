@@ -73,6 +73,7 @@ than crashing.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1852,6 +1853,195 @@ def _render_run_detail(scr: RunDetailScreen, frame: Any, pr: Any) -> None:
     )
 
 
+_CURSOR_GLYPH = "▏"
+
+
+def _build_prompt_modal_text(modal: "_PromptModal", pr: Any) -> Any:
+    """Build the styled ``pyratatui.Text`` that the prompt modal paints.
+
+    Lifted out of :func:`_render_modal` so tests can introspect the
+    resulting ``Line`` / ``Span`` tree without round-tripping through
+    a live ``Paragraph`` (which doesn't expose its text on the Python
+    side). The cursor position is rendered two ways at once:
+
+    1. A visible :data:`_CURSOR_GLYPH` (``▏``, LEFT ONE EIGHTH BLOCK)
+       inserted *between* characters at ``modal.cursor``. This makes
+       the cell at the cursor position change *content* on every
+       Left/Right/Home/End, which is what the diff render reliably
+       catches — pyratatui emits a buggy SGR sequence for cell
+       updates that change *only* the style modifier
+       (``\\x1b[7m\\x1b[;m`` cancels itself), so a style-only marker
+       was invisible after navigating in the live TUI.
+    2. A reverse-video span on the character *under* the cursor
+       (``modal.value[modal.cursor]``). This survives the same diff
+       path on the open / value-mutation paths and gives the operator
+       a thicker visual anchor than the thin glyph alone.
+
+    When ``value`` is empty and a ``placeholder`` is set, the cursor
+    sits at column 0 — we paint the glyph plus a reversed space, then
+    render the placeholder dimmed inside square brackets so the
+    operator can tell the placeholder isn't yet "real" input. The
+    next printable keystroke replaces this branch with the
+    value-bearing one.
+    """
+    Color = pr.Color
+    Line = pr.Line
+    Span = pr.Span
+    Style = pr.Style
+    Text = pr.Text
+
+    cursor_style = Style().reversed()
+    if not modal.value and modal.placeholder:
+        prompt_line = Line(spans=[
+            Span("> "),
+            Span(_CURSOR_GLYPH),
+            Span(" ", style=cursor_style),
+            Span(
+                f"[{modal.placeholder}]",
+                style=Style().fg(Color.gray()),
+            ),
+        ])
+    else:
+        cursor = max(0, min(len(modal.value), modal.cursor))
+        before = modal.value[:cursor]
+        at = modal.value[cursor:cursor + 1] or " "
+        after = (
+            modal.value[cursor + 1:]
+            if cursor < len(modal.value)
+            else ""
+        )
+        prompt_line = Line(spans=[
+            Span("> "),
+            Span(before),
+            Span(_CURSOR_GLYPH),
+            Span(at, style=cursor_style),
+            Span(after),
+        ])
+
+    text = Text()
+    text.push_line(Line.from_string(modal.title))
+    text.push_line(Line.from_string(""))
+    if modal.hint:
+        text.push_line(Line.from_string(modal.hint))
+        text.push_line(Line.from_string(""))
+    text.push_line(prompt_line)
+    text.push_line(Line.from_string(""))
+    text.push_line(Line.from_string("Enter to submit · Esc to cancel"))
+    return text
+
+
+_PROMPT_MODAL_FOOTER = "Enter to submit · Esc to cancel"
+
+
+def _compute_prompt_modal_scroll(
+    modal: "_PromptModal", inner_width: int, inner_height: int,
+) -> int:
+    """Pick the ``Paragraph.scroll`` y-offset that keeps ``modal.cursor``
+    visible inside the modal's bordered inner area.
+
+    Mirrors :func:`_compute_log_window`'s job for the agent-log panel:
+    when the wrapped prompt text exceeds ``inner_height`` rendered rows
+    (a 500-char paste in an 80×24 terminal lands here), the cursor row
+    can fall below the modal's bottom border and the operator can no
+    longer see what they're typing — the exact symptom the original
+    bug flagged. We simulate ratatui's word-wrap for every line in
+    the modal text (title, blank, optional hint+blank, prompt, blank,
+    footer), find the rendered row the cursor glyph lands on, and
+    return enough scroll to pin that row to the bottom of the visible
+    window. Content that already fits returns ``0`` so the title
+    stays at the top.
+
+    The prompt line is reconstructed exactly as
+    :func:`_build_prompt_modal_text` builds it (``"> "`` prefix +
+    value-before-cursor + cursor glyph + value-at-cursor +
+    value-after-cursor) so the wrap simulation processes the same
+    grapheme stream pyratatui paints. Reusing
+    :func:`_word_wrap_indices` (the WordWrapper port) for both the
+    surrounding lines and the prompt line keeps the math honest for
+    space-separated prompts: a 40-word sentence at width 60 lands on
+    ~40 rendered rows, not the ~21 the previous
+    ``ceil(cells / width)`` estimate predicted, so the cursor stays
+    on screen for ordinary typed prompts (the reviewer's pin).
+    """
+    inner_width = max(1, inner_width)
+    inner_height = max(1, inner_height)
+
+    # Reconstruct the prompt line the same way
+    # ``_build_prompt_modal_text`` does — span boundaries don't
+    # affect ratatui's wrap (it walks graphemes, not spans), so the
+    # joined string is what gets reflowed.
+    cursor = max(0, min(len(modal.value), modal.cursor))
+    if not modal.value and modal.placeholder:
+        # Spans: "> " + "▏" + " " + "[placeholder]" → joined.
+        prefix_chars = 2  # "> "
+        prompt_line = (
+            "> "
+            + _CURSOR_GLYPH
+            + " "
+            + f"[{modal.placeholder}]"
+        )
+        cursor_grapheme_idx = prefix_chars
+    else:
+        before = modal.value[:cursor]
+        at = modal.value[cursor:cursor + 1] or " "
+        after = (
+            modal.value[cursor + 1:]
+            if cursor < len(modal.value)
+            else ""
+        )
+        prompt_line = "> " + before + _CURSOR_GLYPH + at + after
+        cursor_grapheme_idx = 2 + len(before)  # index of cursor glyph
+
+    # Each surrounding line's row count via the shared word-wrap
+    # primitive so they agree with how ratatui actually flows them.
+    title_rows = _rendered_rows_for(modal.title, inner_width)
+    hint_rows = (
+        _rendered_rows_for(modal.hint, inner_width) if modal.hint else 0
+    )
+    footer_rows = _rendered_rows_for(_PROMPT_MODAL_FOOTER, inner_width)
+
+    prompt_wrapped = _word_wrap_indices(
+        prompt_line, inner_width, trim=False,
+    )
+    prompt_rows = max(1, len(prompt_wrapped))
+
+    # Locate the cursor glyph's wrapped row inside the prompt line.
+    # If we somehow miss it (truncated by a width-larger-than-row
+    # codepoint, which ratatui drops), fall back to the last row
+    # so the cursor stays visible at the bottom rather than off the
+    # top.
+    cursor_row_in_prompt = prompt_rows - 1
+    for ri, row in enumerate(prompt_wrapped):
+        if cursor_grapheme_idx in row:
+            cursor_row_in_prompt = ri
+            break
+
+    # Title (1 line block) + blank + optional (hint + blank) sit
+    # above the prompt; their rendered-row sum is where the prompt
+    # actually starts in the wrapped output.
+    prompt_start_row = title_rows + 1
+    if modal.hint:
+        prompt_start_row += hint_rows + 1
+
+    cursor_row = prompt_start_row + cursor_row_in_prompt
+    total_rows = (
+        prompt_start_row + prompt_rows + 1 + footer_rows
+    )
+
+    if total_rows <= inner_height:
+        return 0
+
+    if cursor_row >= inner_height:
+        scroll_y = cursor_row - inner_height + 1
+    else:
+        scroll_y = 0
+
+    # Don't scroll past the tail — would just paint blank rows below
+    # the content and waste vertical space the operator could see.
+    scroll_y = min(scroll_y, max(0, total_rows - inner_height))
+    return scroll_y
+
+
 def _render_modal(modal: Any, frame: Any, pr: Any) -> None:
     """Centered overlay box for any of the modal state classes."""
     Block = pr.Block
@@ -1890,17 +2080,29 @@ def _render_modal(modal: Any, frame: Any, pr: Any) -> None:
     frame.render_widget(Clear(), area)
 
     if isinstance(modal, _PromptModal):
-        body_lines = [modal.title, ""]
-        if modal.hint:
-            body_lines.extend([modal.hint, ""])
-        prompt_line = f"> {modal.value}"
-        if not modal.value and modal.placeholder:
-            prompt_line = f"> [{modal.placeholder}]"
-        body_lines.append(prompt_line)
-        body_lines.append("")
-        body_lines.append("Enter to submit · Esc to cancel")
+        text = _build_prompt_modal_text(modal, pr)
+        # ``wrap(True, False)`` folds a long ``modal.value`` onto the
+        # next visible row instead of clipping at the modal's right
+        # edge. ``trim=False`` preserves leading whitespace on the
+        # continuation rows so a multi-line prompt that's been pasted
+        # in keeps its indentation legible.
+        #
+        # Wrapping alone isn't enough: a long value can render more
+        # rows than the modal's inner height, which would clip the
+        # cursor below the bottom border. ``_compute_prompt_modal_scroll``
+        # picks the ``Paragraph.scroll`` offset that pins the cursor's
+        # row to the bottom of the visible window when it would
+        # otherwise overflow, mirroring the agent-log panel's
+        # rendered-row scroll model (see :func:`_compute_log_window`).
+        inner_width = max(1, area.width - 2)
+        inner_height = max(1, area.height - 2)
+        scroll_y = _compute_prompt_modal_scroll(
+            modal, inner_width, inner_height,
+        )
         frame.render_widget(
-            Paragraph.from_string("\n".join(body_lines))
+            Paragraph(text)
+                .wrap(True, False)
+                .scroll(scroll_y, 0)
                 .block(Block().bordered().title("prompt"))
                 .style(Style().fg(Color.white())),
             area,
@@ -1958,20 +2160,370 @@ def _render_modal(modal: Any, frame: Any, pr: Any) -> None:
         return
 
 
+def _resolve_codepoint_widths(line: str) -> List[int]:
+    """For each codepoint in *line*, return the cell width it
+    contributes under ratatui's cluster-aware width rules.
+
+    Ratatui's ``cell_width()`` (in ``ratatui-core/src/buffer/
+    cell_width.rs``) calls ``UnicodeWidthStr::width()`` from the
+    ``unicode-width`` 0.2.x crate, which implements **string-level
+    rules** for emoji ligatures on top of the per-codepoint table:
+
+    * Well-formed, fully-qualified **emoji ZWJ sequences**
+      (``👨\u200d👩\u200d👦`` family, ``🧑\u200d💻`` profession,
+      ``👩\u200d❤️\u200d👨`` couple, …) → **2 cells** total.
+    * **Emoji modifier sequences** (a base + skin tone modifier,
+      ``👋🏻``) → **2 cells** total.
+    * **Emoji presentation sequences** (a narrow base + VS16
+      ``\\ufe0f``, ``☁️``, ``❤️``, ``⚡️``) → **2 cells** total.
+
+    These rules apply to a *grapheme cluster* as a unit, not to its
+    constituent codepoints. The per-codepoint table would say a
+    family ZWJ emoji is ``2+0+2+0+2 = 6`` cells (each emoji base
+    East-Asian-Wide, each ZWJ zero-width), but ratatui's
+    ``set_string`` renders one as a single 2-cell wide grapheme,
+    same as plain ``界``. Without cluster awareness, the wrap math
+    over-counted prompt rows by a factor of ~3 for emoji-heavy
+    prompts, and the cursor row landed *above* the modal's visible
+    window — the symptom the latest review pinned for
+    ``👨\u200d👩\u200d👦`` × 100 at 60×8.
+
+    For each codepoint we attribute the cluster's full cell width
+    to its first codepoint and zero out the rest. The wrap loop in
+    :func:`_word_wrap_indices` walks codepoints (not graphemes) and
+    sums these values; concentrating each cluster's width in a
+    single codepoint lets that loop break exactly where ratatui's
+    grapheme-aware wrapper would, modulo the harmless detail that
+    we may carry an entire cluster's codepoints into the wrapped
+    row even when only the first one would have crossed the row
+    boundary in ratatui (the cluster's other codepoints are 0-cell,
+    so they don't shift any visible cell).
+
+    Cluster detection (no dependency on grapheme-segmentation):
+
+    * A cluster begins at any non-extension codepoint.
+    * Extensions, consumed greedily after the base:
+      - ``\\ufe0f`` (VS16, emoji presentation selector) — sets the
+        cluster's ``has_vs16`` flag.
+      - ``\\ufe0e`` (VS15, text presentation selector) — extends but
+        does not widen.
+      - ``\\U0001F3FB``..``\\U0001F3FF`` (emoji modifier base /
+        skin-tone modifiers) — sets ``has_modifier``.
+      - General category ``Mn`` (nonspacing mark) / ``Me``
+        (enclosing mark) — combining marks, extend with no widening.
+      - General category ``Cf`` — format chars (other than ZWJ),
+        zero-width.
+      - ``\\u200d`` (ZWJ) — *only* if there is a next codepoint to
+        join. Sets ``has_zwj_join``, consumes the ZWJ + the joined
+        base; the loop then continues, picking up the joined base's
+        own extensions.
+
+    Cluster width:
+
+    * ``has_zwj_join`` or ``has_modifier`` → 2 cells (per the
+      emoji-ligature rules above).
+    * ``has_vs16`` (without the above) → 2 cells (emoji-presentation
+      sequence widens to 2).
+    * Otherwise → sum of per-codepoint widths within the cluster
+      (combining marks 0, East Asian W/F 2, rest 1).
+
+    Permissive heuristic: any base + ZWJ + base / + modifier / +
+    VS16 widens to 2 even for non-emoji codepoints (Python's stdlib
+    doesn't ship the Unicode ``Emoji`` / ``Emoji_Presentation``
+    tables). Edge cases like ``a\\u200da`` over-estimate by 1 cell
+    — the safe direction (over-scrolling clamps at the tail;
+    under-scrolling clips the cursor).
+    """
+    n = len(line)
+    widths = [0] * n
+    i = 0
+    while i < n:
+        start = i
+        ch = line[i]
+        cp = ord(ch)
+        cat = unicodedata.category(ch)
+
+        # Solo extension / zero-width codepoints at a cluster boundary
+        # don't form a 2-cell emoji cluster on their own — a stray
+        # VS16 / ZWJ / emoji modifier without a preceding base
+        # contributes 0 cells, same as a stray combining mark. Without
+        # this guard, ``\ufe0f`` repeated 50 times would be modelled
+        # as one cluster with ``has_vs16=True`` and credited 2 cells,
+        # disagreeing with ratatui.
+        is_extension = (
+            ch in ("\ufe0f", "\ufe0e", "\u200d")
+            or 0x1F3FB <= cp <= 0x1F3FF
+            or cat in ("Mn", "Me", "Cf", "Cc")
+        )
+        if is_extension:
+            i += 1
+            continue
+
+        i += 1
+        has_zwj_join = False
+        has_modifier = False
+        has_vs16 = False
+        while i < n:
+            ch = line[i]
+            cp = ord(ch)
+            if ch == "\ufe0f":
+                has_vs16 = True
+                i += 1
+                continue
+            if ch == "\ufe0e":
+                # VS15 — text presentation. Extend, no widening.
+                i += 1
+                continue
+            if 0x1F3FB <= cp <= 0x1F3FF:
+                has_modifier = True
+                i += 1
+                continue
+            cat = unicodedata.category(ch)
+            if cat in ("Mn", "Me"):
+                i += 1
+                continue
+            if ch == "\u200d":
+                # ZWJ only joins if there's a next base codepoint.
+                if i + 1 < n:
+                    has_zwj_join = True
+                    i += 1  # consume the ZWJ
+                    i += 1  # consume the joined base; its own
+                            # extensions will be picked up by the
+                            # next iteration of this loop.
+                    continue
+                break
+            if cat == "Cf":
+                # Other format chars (zero-width).
+                i += 1
+                continue
+            break
+
+        if has_zwj_join or has_modifier or has_vs16:
+            cluster_w = 2
+        else:
+            cluster_w = 0
+            for k in range(start, i):
+                ch = line[k]
+                cat = unicodedata.category(ch)
+                if cat in ("Mn", "Me", "Cf", "Cc"):
+                    continue
+                if unicodedata.east_asian_width(ch) in ("W", "F"):
+                    cluster_w += 2
+                else:
+                    cluster_w += 1
+        widths[start] = cluster_w
+    return widths
+
+
+def _display_cell_width(s: str) -> int:
+    """Display width of *s* in terminal cells.
+
+    Ratatui's wrap implementation breaks lines based on terminal cell
+    width (via the ``unicode-width`` crate's grapheme-aware
+    ``cell_width()``), not Python codepoint count. We approximate
+    that here so the prompt-modal scroll math and the agent-log row
+    math agree with how pyratatui actually flows the rendered
+    Paragraph.
+
+    Width is the sum of :func:`_resolve_codepoint_widths`, which
+    encodes both the per-codepoint width rules (combining marks /
+    format chars / control chars → 0; East Asian W or F → 2; rest
+    → 1) and the cluster-level emoji-ligature rules from
+    ``unicode-width`` 0.2.x — emoji ZWJ sequences, emoji modifier
+    sequences, and emoji presentation sequences each widen to a
+    single 2-cell grapheme.
+
+    Without those cluster rules, prompts containing 100 family
+    emojis were modelled as ~600 cells (each family =
+    ``2+0+2+0+2``), but ratatui paints them as 200 cells (each
+    family = a single 2-cell wide grapheme). The wrap math
+    over-counted rows, the cursor row was computed on a non-existent
+    row above the visible window, and the operator typed blind —
+    the reviewer's latest pin.
+    """
+    return sum(_resolve_codepoint_widths(s))
+
+
+def _word_wrap_indices(
+    line: str, max_width: int, trim: bool = False,
+) -> List[List[int]]:
+    """Word-wrap *line* to *max_width* cells, returning one list of
+    Python codepoint indices per rendered row.
+
+    This is a Python port of ratatui's ``WordWrapper`` (see
+    ``ratatui-widgets/src/reflow.rs``) with the same semantics
+    pyratatui's ``Paragraph.wrap(True, trim)`` invokes:
+
+    * Words are runs of non-whitespace graphemes; whitespace runs
+      separate them. ``\\xa0`` (NBSP) is *not* a separator, matching
+      ``str::is_whitespace``-style rules in ratatui.
+    * When the running line plus the next word would overflow, the
+      running line is committed and the word lands on a fresh row.
+      With ``trim=False`` the leading whitespace of a wrapped row is
+      preserved (so pasted multi-line prompts keep their
+      indentation legible); with ``trim=True`` it's discarded.
+    * A word longer than ``max_width`` itself gets character-wrapped:
+      the algorithm emits as many full rows as fit, leaving the tail
+      on the next row.
+    * Per-codepoint width comes from :func:`_resolve_codepoint_widths`,
+      which detects emoji clusters (ZWJ sequences, modifier
+      sequences, VS16 presentation sequences) and concentrates each
+      cluster's full 2-cell width on its first codepoint. The
+      remaining codepoints in the cluster contribute 0 cells, so
+      walking codepoints sums to the same total ratatui's
+      grapheme-aware ``cell_width()`` would compute, and wrap breaks
+      land on the same row boundaries the renderer paints.
+
+    The returned indices map back to the original *line* so callers
+    can ask "which rendered row does ``line[idx]`` land on" — the
+    primitive :func:`_compute_prompt_modal_scroll` uses to track the
+    cursor glyph through wrapped output. Callers needing only row
+    counts (the agent-log scroll math) use :func:`_rendered_rows_for`,
+    which is a thin wrapper around this.
+
+    The previous helper used ``ceil(cell_width / width)`` as a row
+    estimate, which under-counted rows for ordinary sentence-like
+    prompts: words can't be split mid-grapheme, so a 30-char word
+    in a 60-cell row that already has 32 cells of content gets
+    pushed onto its own line, leaving the row half-empty. The
+    cell-slicing math ignored that, mis-positioned the cursor by
+    enough rows to fall outside the modal's visible window for
+    space-separated prompts, and forced the operator to type
+    blind — exactly the symptom the latest review pinned.
+    """
+    if max_width <= 0:
+        return [list(range(len(line)))]
+
+    wrapped: List[List[int]] = []
+    pending_line: List[int] = []
+    line_width = 0
+    pending_word: List[int] = []
+    word_width = 0
+    pending_ws: Deque[Tuple[int, int]] = deque()
+    whitespace_width = 0
+    non_whitespace_previous = False
+
+    # Pre-resolve per-codepoint widths so emoji ZWJ sequences /
+    # modifier sequences / VS16 presentation sequences each
+    # contribute a single 2-cell wide cluster (with the cluster's
+    # full width concentrated on its first codepoint). Computing
+    # this once outside the loop also keeps the cluster-detection
+    # state machine from leaking into the wrap algorithm.
+    sym_widths = _resolve_codepoint_widths(line)
+
+    for idx, ch in enumerate(line):
+        sym_w = sym_widths[idx]
+        is_ws = ch.isspace() and ch != "\xa0"
+
+        # Symbols wider than the line itself are dropped — ratatui
+        # does the same; rendering one would blow past the modal
+        # border without us being able to fold it.
+        if sym_w > max_width:
+            continue
+
+        word_found = non_whitespace_previous and is_ws
+        trimmed_overflow = (
+            not pending_line
+            and trim
+            and word_width + sym_w > max_width
+        )
+        whitespace_overflow = (
+            not pending_line
+            and trim
+            and whitespace_width + sym_w > max_width
+        )
+        untrimmed_overflow = (
+            not pending_line
+            and not trim
+            and word_width + whitespace_width + sym_w > max_width
+        )
+
+        if word_found or trimmed_overflow or whitespace_overflow or untrimmed_overflow:
+            if pending_line or not trim:
+                while pending_ws:
+                    pending_line.append(pending_ws.popleft()[0])
+                line_width += whitespace_width
+            pending_line.extend(pending_word)
+            line_width += word_width
+
+            pending_ws.clear()
+            whitespace_width = 0
+            pending_word = []
+            word_width = 0
+
+        line_full = line_width >= max_width
+        pending_word_overflow = (
+            sym_w > 0
+            and line_width + whitespace_width + word_width >= max_width
+        )
+
+        if line_full or pending_word_overflow:
+            remaining = max_width - line_width
+            wrapped.append(pending_line)
+            pending_line = []
+            line_width = 0
+
+            # Trim trailing whitespace that fits in the remainder of
+            # the just-emitted row — ratatui drops it so a wrapped
+            # line doesn't start with a stray space.
+            while pending_ws:
+                _, ws_w = pending_ws[0]
+                if ws_w > remaining:
+                    break
+                whitespace_width -= ws_w
+                remaining -= ws_w
+                pending_ws.popleft()
+
+            if is_ws and not pending_ws:
+                continue
+
+        if is_ws:
+            whitespace_width += sym_w
+            pending_ws.append((idx, sym_w))
+        else:
+            word_width += sym_w
+            pending_word.append(idx)
+
+        non_whitespace_previous = not is_ws
+
+    if not pending_line and not pending_word and pending_ws and trim:
+        wrapped.append([])
+
+    if pending_line or not trim:
+        while pending_ws:
+            pending_line.append(pending_ws.popleft()[0])
+
+    pending_line.extend(pending_word)
+
+    if pending_line:
+        wrapped.append(pending_line)
+
+    if not wrapped:
+        wrapped.append([])
+
+    return wrapped
+
+
 def _rendered_rows_for(line: str, width: int) -> int:
     """How many rendered rows the *line* will occupy when soft-wrapped
-    at *width* cells.
+    at *width* cells under ratatui's word-wrap (``trim=False``).
 
-    The math approximates ratatui's wrap behavior with
-    ``ceil(len / width)`` and a floor of 1 (so an empty line still
-    occupies one rendered row). It does **not** account for wide
-    Unicode glyphs or hard tabs — that inaccuracy can shift the
-    visible window by one row in pathological cases, but never by
-    enough to skip the latest content. The next render tick reflows
-    against the live geometry either way."""
+    Backed by :func:`_word_wrap_indices` so the answer matches what
+    pyratatui's ``Paragraph.wrap(True, False)`` actually paints —
+    including the case where a long word can't share a row with
+    leading content (forcing the previous row to commit half-empty)
+    and the case where wide Unicode contributes two cells per
+    grapheme. Always at least 1 (an empty line still occupies a
+    rendered row).
+
+    Hard tabs are still counted as zero cells (they're category
+    ``Cc`` per :func:`_display_cell_width`); the renderer expands
+    them on its side, but we don't see TTY-tab expansion in log
+    lines so the inaccuracy doesn't surface in practice."""
     if width <= 0:
         return 1
-    return max(1, -(-len(line) // width))
+    rows = _word_wrap_indices(line, width, trim=False)
+    return max(1, len(rows))
 
 
 def _total_rendered_rows(lines: Iterable[str], width: int) -> int:

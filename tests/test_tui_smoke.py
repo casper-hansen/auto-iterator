@@ -39,9 +39,12 @@ from auto_iterator.tui import (  # noqa: E402
     RunListApp,
     RunListScreen,
     _BackendChoiceModal,
+    _build_prompt_modal_text,
     _compute_log_window,
+    _compute_prompt_modal_scroll,
     _ConfirmModal,
     _DiffViewer,
+    _display_cell_width,
     _PromptModal,
     _rendered_rows_for,
     _render_run_detail,
@@ -1145,6 +1148,913 @@ def test_render_run_detail_constructs_widgets_against_real_pyratatui():
         # Status bar, agent-log Paragraph, footer — at least three
         # widgets land in the stub frame's queue.
         assert len(frame.widgets) >= 3
+
+
+def test_render_prompt_modal_paragraph_has_wrap_enabled():
+    """Pin the prompt-modal wrap contract.
+
+    A long ``modal.value`` (a multi-paragraph task description, a
+    pasted-in workspace path, a quoted command line) must fold onto
+    subsequent rows so the operator can see *the entire prompt while
+    typing it* instead of having the tail clipped at the modal's
+    right edge. We pin the contract via the Paragraph's repr because
+    that's the same trick the agent-log wrap pin uses.
+    """
+    import pyratatui as pr
+
+    rows = [_make_run_row()]
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch(
+            "auto_iterator.tui.list_runs", return_value=rows,
+        ):
+            app = RunListApp(Path(tmp))
+            _press(app, "n")
+            modal = app.screen.modals[-1]
+            assert isinstance(modal, _PromptModal)
+            modal.value = "x" * 500
+            modal.cursor = len(modal.value)
+
+        frame = _make_stub_frame(width=80, height=24)
+        _render_run_list(app.screen, frame, pr)
+
+        prompt_paragraph = None
+        for widget, _area in frame.widgets:
+            rendered = repr(widget)
+            if rendered.startswith("Paragraph"):
+                prompt_paragraph = widget
+        assert prompt_paragraph is not None, (
+            "expected the modal renderer to emit a Paragraph"
+        )
+        rendered = repr(prompt_paragraph)
+        assert "wrap=true" in rendered, (
+            "the prompt-modal Paragraph must enable wrap so a long "
+            "value folds instead of being clipped at the modal's "
+            f"right edge; got repr={rendered!r}"
+        )
+
+
+def _prompt_line_spans(text: Any) -> list:
+    """Return the spans of the line that starts with ``"> "`` in *text*.
+
+    The prompt modal's renderer builds a structured ``pyratatui.Text``
+    where the prompt-input row is the only one that begins with the
+    ``"> "`` prefix. The other rows are title / hint / footer lines
+    that ``Line.from_string`` builds as a single span.
+    """
+    for ln in text.lines:
+        spans = ln.spans
+        if spans and spans[0].content == "> ":
+            return list(spans)
+    return []
+
+
+_CURSOR_GLYPH = "\u258f"  # LEFT ONE EIGHTH BLOCK (mirror of tui._CURSOR_GLYPH)
+
+
+def test_prompt_modal_renders_cursor_glyph_and_reversed_span():
+    """The prompt modal must paint a visible cursor at ``modal.cursor``.
+
+    The renderer combines two cues so the cursor stays visible across
+    the live TUI's render paths:
+
+    1. A ``▏`` glyph inserted *between* characters at the cursor —
+       the cell content changes when the cursor moves, which the
+       cell-diff render reliably catches.
+    2. A reverse-video span on the character under the cursor — a
+       thicker visual anchor whenever the diff path is on its
+       full-redraw branch (open / value mutation).
+    """
+    import pyratatui as pr
+
+    modal = _PromptModal(
+        title="t", hint="h", value="hello world", cursor=6,
+    )
+    text = _build_prompt_modal_text(modal, pr)
+    spans = _prompt_line_spans(text)
+    assert [s.content for s in spans] == [
+        "> ", "hello ", _CURSOR_GLYPH, "w", "orld",
+    ], (
+        "prompt line must split into prefix / before-cursor / "
+        "cursor-glyph / cursor-char / after-cursor spans; got "
+        f"{[s.content for s in spans]!r}"
+    )
+    cursor_span = spans[3]
+    assert "REVERSED" in repr(cursor_span.style), (
+        "the cursor character must be painted with reverse video "
+        f"so the operator has a thicker anchor; got "
+        f"style repr={repr(cursor_span.style)!r}"
+    )
+
+
+def test_prompt_modal_renders_cursor_at_end_of_value():
+    """Cursor parked past the last character must still be visible.
+
+    The default ``cursor = len(value)`` after typing a few keys is the
+    common case — the renderer paints a glyph + reversed space at the
+    end-of-line position so the operator sees an unmistakable "I'm
+    typing here" marker.
+    """
+    import pyratatui as pr
+
+    modal = _PromptModal(title="t", value="abc")
+    assert modal.cursor == len(modal.value)
+    text = _build_prompt_modal_text(modal, pr)
+    spans = _prompt_line_spans(text)
+    assert [s.content for s in spans] == [
+        "> ", "abc", _CURSOR_GLYPH, " ", "",
+    ], (
+        f"got {[s.content for s in spans]!r}"
+    )
+    cursor_span = spans[3]
+    assert cursor_span.content == " ", (
+        "cursor span at end-of-value must be a single space so "
+        f"there's something to paint; got {cursor_span.content!r}"
+    )
+    assert "REVERSED" in repr(cursor_span.style)
+
+
+def test_compute_prompt_modal_scroll_zero_when_content_fits():
+    """Short prompts that already fit in the modal must not scroll —
+    the title would otherwise jump off the top, hiding context the
+    operator was looking at."""
+    modal = _PromptModal(title="t", hint="h", value="abc")
+    assert _compute_prompt_modal_scroll(modal, inner_width=60, inner_height=12) == 0
+    # Empty + placeholder is the open-modal state. Cursor sits at
+    # column 2; the whole text is 5 rows tall and trivially fits.
+    empty = _PromptModal(title="t", placeholder="ph", value="")
+    assert _compute_prompt_modal_scroll(empty, inner_width=60, inner_height=12) == 0
+
+
+def test_compute_prompt_modal_scroll_pins_cursor_to_bottom_for_long_prompt():
+    """Pin the reviewer's "see the cursor on a long wrapped prompt"
+    contract.
+
+    With a 500-char value and a cursor parked at the end (the common
+    typing-position state), the rendered Paragraph spans more rows
+    than a typical 80×24 terminal's modal can display. Without a
+    scroll offset, the cursor row falls below the modal's bottom
+    border. The helper picks an offset that pins the cursor row to
+    the bottom of the visible window."""
+    modal = _PromptModal(title="t", value="x" * 500)
+    modal.cursor = len(modal.value)
+
+    # Inner area: 60 wide × 8 tall — representative of an 80×24
+    # terminal once the modal's 80% / 60% sizing and 1-cell border
+    # are deducted.
+    inner_width, inner_height = 60, 8
+
+    # Layout per ``_build_prompt_modal_text``:
+    #   title (1) + blank (1) + prompt (≈9) + blank (1) + footer (1)
+    # cursor at col 2+500=502; row_in_prompt = 502 // 60 = 8;
+    # absolute cursor row = 2 + 8 = 10.
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    cursor_col = 2 + len(modal.value)
+    cursor_row = 2 + cursor_col // inner_width  # 2 = title + blank rows above prompt
+    assert cursor_row >= inner_height, (
+        "test setup: cursor must overflow the inner area for this case "
+        "to exercise the scroll path"
+    )
+    # Cursor must be visible: scroll <= cursor_row < scroll + inner_height
+    assert scroll <= cursor_row < scroll + inner_height, (
+        f"cursor row {cursor_row} not visible in window "
+        f"[{scroll}, {scroll + inner_height}); scroll={scroll}"
+    )
+    assert scroll > 0, (
+        "the long prompt must produce a non-zero scroll so the cursor "
+        f"is reachable; got scroll={scroll}"
+    )
+
+
+def test_compute_prompt_modal_scroll_keeps_top_visible_when_cursor_is_near_start():
+    """A cursor near the start of a long prompt must NOT scroll the
+    title off-screen — only enough scroll to keep the cursor in the
+    viewport, no more. Otherwise an operator who pressed Home on a
+    long pasted prompt would lose the title/hint context."""
+    modal = _PromptModal(title="t", hint="h", value="x" * 500, cursor=0)
+    inner_width, inner_height = 60, 8
+
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+    # Cursor sits on the prompt row — row 4 (title + blank + hint +
+    # blank above the prompt) — well within the 8-row viewport, so
+    # no scroll is needed.
+    assert scroll == 0, (
+        "Home / cursor-near-start must not scroll past the title/hint; "
+        f"got scroll={scroll}"
+    )
+
+
+def test_compute_prompt_modal_scroll_clamps_to_content_tail():
+    """The helper must never scroll past the end of the rendered
+    content — that just paints blank rows below the footer."""
+    modal = _PromptModal(title="t", value="x" * 500)
+    modal.cursor = len(modal.value)
+
+    inner_width, inner_height = 60, 8
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    # Compute the total rendered rows the way the renderer would.
+    total_rows = (
+        _rendered_rows_for("t", inner_width)              # title
+        + 1                                                # blank
+        + _rendered_rows_for("x" * (2 + 500 + 1), inner_width)  # prompt
+        + 1                                                # blank
+        + _rendered_rows_for("Enter to submit · Esc to cancel", inner_width)
+    )
+    assert scroll <= max(0, total_rows - inner_height), (
+        f"scroll {scroll} would paint blank rows past the footer "
+        f"(total_rows={total_rows}, inner_height={inner_height})"
+    )
+
+
+def test_compute_prompt_modal_scroll_handles_wide_unicode_prompt():
+    """Reviewer pin: ratatui wraps on cell width, not codepoint
+    count, so a 500-character CJK prompt (each ``界`` is two cells)
+    actually wraps to ~17 rows at width 60 — not the ~9 rows the
+    Python ``len()`` proxy used to predict. With the old math the
+    scroll offset came out to ``3`` and the cursor (≈ row 18) fell
+    well outside the ``[3, 11)`` visible window. The cell-width
+    helper must place the cursor inside the rendered viewport for
+    wide Unicode the same way it does for ASCII.
+    """
+    value = "界" * 500
+    modal = _PromptModal(title="t", value=value)
+    modal.cursor = len(value)
+
+    inner_width, inner_height = 60, 8
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    # Cursor column / row derived using terminal cell width, not
+    # codepoint count. ``> `` is 2 cells, each ``界`` is 2 cells.
+    cursor_col_cells = 2 + 2 * len(value)
+    cursor_row = 2 + cursor_col_cells // inner_width  # 2 = title + blank
+    assert cursor_row >= inner_height, (
+        "test setup: cursor must overflow the inner area for this case "
+        "to exercise the wide-unicode scroll path"
+    )
+    assert scroll <= cursor_row < scroll + inner_height, (
+        f"wide-unicode cursor row {cursor_row} not visible in window "
+        f"[{scroll}, {scroll + inner_height}); scroll={scroll}"
+    )
+
+
+def test_compute_prompt_modal_scroll_handles_mixed_unicode_cursor_position():
+    """Cursor mid-way through a mixed ASCII + CJK prompt must land
+    on the row that matches its cell column, not its Python index.
+
+    The previous ``len()``-based math underestimated cursor position
+    by half whenever the value before the cursor was CJK-heavy, so
+    the scroll offset stayed ``0`` even when the cursor row had
+    already overflowed the viewport. Pin the cell-width-based math
+    explicitly so this regression can't sneak back in.
+    """
+    # 200 CJK chars (= 400 cells) followed by 100 ASCII (= 100 cells).
+    value = "界" * 200 + "x" * 100
+    modal = _PromptModal(title="t", value=value)
+    # Cursor sits right at the boundary — 200 CJK chars consumed,
+    # which is 400 cells of column space.
+    modal.cursor = 200
+
+    inner_width, inner_height = 60, 8
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    cursor_col_cells = 2 + 2 * 200  # ``> `` + 200 wide chars
+    cursor_row = 2 + cursor_col_cells // inner_width
+    assert scroll <= cursor_row < scroll + inner_height, (
+        f"mixed-unicode cursor row {cursor_row} not visible in window "
+        f"[{scroll}, {scroll + inner_height}); scroll={scroll}"
+    )
+
+
+def test_rendered_rows_for_uses_cell_width_for_wide_unicode():
+    """Each ``界`` occupies two terminal cells, so 50 of them at
+    width 60 should wrap to two rows, not one. This is the
+    primitive the modal's scroll math (and the agent log's) relies
+    on; if it under-counts, downstream callers under-scroll and
+    clip recent content."""
+    assert _rendered_rows_for("界" * 50, 60) == 2  # 100 cells / 60 → 2 rows
+    assert _rendered_rows_for("界" * 30, 60) == 1  # 60 cells / 60 → 1 row
+    # ASCII path is unchanged so existing callers don't shift.
+    assert _rendered_rows_for("x" * 60, 60) == 1
+    assert _rendered_rows_for("x" * 61, 60) == 2
+
+
+def test_rendered_rows_for_treats_combining_marks_as_zero_width():
+    """Combining marks (Mn / Me) and zero-width format characters
+    must contribute 0 cells, matching ratatui's ``unicode-width``
+    wrap math.
+
+    Reviewer pin: ``a`` plus 500 combining accents is *one* cell
+    wide (the accents stack on top of the base ``a``), so it must
+    fit on a single rendered row even at width 1 — the previous
+    implementation counted each combining mark as 1 cell and
+    reported 501 rows, which over-scrolled the prompt modal and
+    pushed the cursor *above* the visible window."""
+    base_with_accents = "a" + "\u0301" * 500
+    assert _rendered_rows_for(base_with_accents, 60) == 1, (
+        "500 combining accents stacked on a single 'a' base must "
+        "share one cell, not 500"
+    )
+    # Zero-width joiners and other Cf format characters likewise
+    # contribute nothing to the wrapped row count.
+    zwj_seq = "\u200D" * 200
+    assert _rendered_rows_for(zwj_seq, 60) == 1
+    # Control characters (Cc) — \t, \0, etc. — also 0 cells.
+    assert _rendered_rows_for("\t" * 200, 60) == 1
+
+
+def test_compute_prompt_modal_scroll_handles_combining_marks():
+    """Reviewer pin: a base character plus many combining marks
+    must NOT scroll the modal — the marks stack on top of the base,
+    consuming zero additional cells, so the cursor stays on the
+    first prompt row.
+
+    The previous implementation counted each combining mark as one
+    cell, which ballooned the apparent prompt cell-width to 500+ and
+    over-scrolled the modal by enough rows to hide the cursor
+    *above* the visible window. The reviewer's repro: ``a`` plus
+    500 ``\\u0301`` accents at 60×8 → helper used to scroll to
+    ``[3, 11)`` while the actual cursor row was ``2``.
+    """
+    value = "a" + "\u0301" * 500
+    modal = _PromptModal(title="t", value=value)
+    modal.cursor = len(value)
+
+    inner_width, inner_height = 60, 8
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    # The whole prompt is 1 cell wide ('a' + 0 + 0 + …), so the
+    # rendered text fits trivially in 8 rows and no scroll is
+    # needed. Anything > 0 means the helper is treating combining
+    # marks as visible columns again.
+    assert scroll == 0, (
+        "combining marks must consume zero cells; the modal must "
+        f"not scroll for 'a' + 500 accents. got scroll={scroll}"
+    )
+    # And the cursor sits at row 2 (title + blank), well within
+    # ``[0, inner_height)``.
+    cursor_row = 2
+    assert scroll <= cursor_row < scroll + inner_height
+
+
+def test_compute_prompt_modal_scroll_handles_zwj_emoji_sequence():
+    """ZWJ emoji clusters (e.g. family / profession emoji) are
+    multiple wide bases held together by ``\\u200D`` joiners.
+    Ratatui's ``unicode-width`` 0.2.x crate (called via
+    ``cell_width()``) implements a string-level rule for
+    well-formed fully-qualified emoji ZWJ sequences: the whole
+    cluster renders as a **single 2-cell wide grapheme**, regardless
+    of how many emoji bases it joins. The scroll math has to agree
+    with that or the cursor row diverges from where the renderer
+    actually paints.
+
+    Reviewer pin: the previous oracle modelled a family ZWJ emoji
+    as ``2 + 0 + 2 + 0 + 2 = 6`` cells (per-codepoint sum). At 60×8
+    with 100 families, the helper picked ``scroll=6`` while the
+    real cursor row was ~5 (200 cells / 60 ≈ 3.4 wrapped rows +
+    title/blank), so the cursor sat *above* the visible window
+    ``[6, 14)``. Empirical confirmation via ``Buffer.set_string``:
+    30 family emojis fit exactly in a 60-cell row (30 × 2 = 60),
+    not 10 (60 / 6).
+    """
+    family = "\U0001F468\u200D\U0001F469\u200D\U0001F466"  # man+woman+boy
+    value = family * 100
+    modal = _PromptModal(title="t", value=value)
+    modal.cursor = len(value)
+
+    inner_width, inner_height = 60, 8
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    # Independently re-derive the cursor's rendered row using the
+    # same word-wrap primitive, but via a fresh prompt-line build
+    # so the assertion isn't tautological with the helper under
+    # test. Mirrors the VS16 / sentence-wrap repros below.
+    from auto_iterator.tui import _word_wrap_indices, _CURSOR_GLYPH
+
+    before = value[:modal.cursor]
+    prompt_line = "> " + before + _CURSOR_GLYPH + " "
+    wrapped = _word_wrap_indices(prompt_line, inner_width, trim=False)
+    cursor_idx = 2 + len(before)
+    cursor_row_in_prompt = next(
+        (ri for ri, row in enumerate(wrapped) if cursor_idx in row),
+        len(wrapped) - 1,
+    )
+    cursor_row = 2 + cursor_row_in_prompt  # title (1) + blank (1)
+
+    # Pin the cluster width: 100 families × 2 cells = 200 cells,
+    # not 600. Without the cluster-aware width helper, the
+    # rendered prompt row count would balloon to ~10 instead of
+    # the ~4 that ratatui actually paints, and the cursor row
+    # would land outside the visible window.
+    from auto_iterator.tui import _display_cell_width
+    assert _display_cell_width(family) == 2, (
+        "family ZWJ emoji must measure as 2 cells (one wide "
+        "grapheme), not 6 (per-codepoint sum). without this the "
+        "wrap math disagrees with ratatui's cell_width()"
+    )
+    assert _display_cell_width(value) == 200, (
+        "100 family ZWJ emojis must measure as 200 cells (one "
+        "2-cell grapheme each), not 600"
+    )
+
+    assert scroll <= cursor_row < scroll + inner_height, (
+        f"ZWJ-emoji cursor row {cursor_row} not visible in window "
+        f"[{scroll}, {scroll + inner_height}); scroll={scroll}"
+    )
+
+
+def test_display_cell_width_handles_emoji_cluster_ligatures():
+    """``unicode-width`` 0.2.x has three string-level emoji
+    ligature rules that ratatui's ``cell_width()`` invokes via
+    ``UnicodeWidthStr::width()``:
+
+    * **Emoji ZWJ sequences** (``\\u200D``-joined bases) → 2 cells.
+    * **Emoji modifier sequences** (base + skin-tone modifier
+      ``\\U0001F3FB..\\U0001F3FF``) → 2 cells.
+    * **Emoji presentation sequences** (narrow base + VS16
+      ``\\ufe0f``) → 2 cells (covered separately below).
+
+    Pin all three rules directly through ``_display_cell_width``
+    so a future regression of the cluster detector shows up here
+    instead of as a "cursor sometimes invisible" symptom in the
+    live modal. Confirmed empirically against pyratatui's
+    ``Buffer.set_string``: 30 family-emoji clusters fit in a
+    60-cell row, 30 hand-with-light-skin-tone clusters fit in a
+    60-cell row.
+    """
+    family = "\U0001F468\u200D\U0001F469\u200D\U0001F466"
+    couple = "\U0001F469\u200D\u2764\ufe0f\u200D\U0001F468"
+    profession = "\U0001F9D1\u200D\U0001F4BB"
+    hand_light = "\U0001F44B\U0001F3FB"
+    hand_dark = "\U0001F44B\U0001F3FF"
+
+    assert _display_cell_width(family) == 2, (
+        "family ZWJ emoji is one 2-cell grapheme, not 6"
+    )
+    assert _display_cell_width(couple) == 2, (
+        "couple-with-heart ZWJ emoji is one 2-cell grapheme"
+    )
+    assert _display_cell_width(profession) == 2, (
+        "technologist ZWJ emoji is one 2-cell grapheme"
+    )
+    assert _display_cell_width(hand_light) == 2, (
+        "modifier sequence is one 2-cell grapheme, not 4"
+    )
+    assert _display_cell_width(hand_dark) == 2, (
+        "modifier sequence is one 2-cell grapheme regardless of "
+        "skin-tone choice"
+    )
+
+    # 100 family ZWJ emojis must scale linearly: 200 cells, not 600.
+    assert _display_cell_width(family * 100) == 200
+    # Mixed plain + cluster: ASCII cells unchanged, cluster
+    # collapsed to 2 cells. "hi " (3) + family (2) + " yo" (3) = 8.
+    assert _display_cell_width("hi " + family + " yo") == 8
+
+    # Bare ZWJ at start/end and standalone modifier: 0 cells.
+    assert _display_cell_width("\u200d") == 0
+    assert _display_cell_width("\u200d" * 200) == 0
+    assert _display_cell_width("\U0001F3FB") == 0, (
+        "lone skin-tone modifier without a preceding base is 0 "
+        "cells, not 2"
+    )
+
+
+def test_rendered_rows_for_handles_emoji_zwj_clusters():
+    """``_rendered_rows_for`` must agree with ratatui's renderer
+    for ZWJ family emoji: 100 family clusters at width 60 wrap to
+    ``ceil(200 / 60) = 4`` rows, not the ``ceil(600 / 60) = 10``
+    the per-codepoint summing helper predicted.
+
+    Empirically pinned via ``Buffer.set_string`` in pyratatui:
+    30 family emojis fill a 60-cell row, so 100 of them need
+    ``ceil(100 / 30) = 4`` rows. The previous helper would have
+    needed 10 rows (since it counted each family as 6 cells), and
+    the modal scroll math built on top of that dragged the cursor
+    below the visible window — the reviewer's pin in the latest
+    round.
+    """
+    family = "\U0001F468\u200D\U0001F469\u200D\U0001F466"
+    rows_100 = _rendered_rows_for(family * 100, 60)
+    assert rows_100 == 4, (
+        f"100 family ZWJ emojis at width 60 must wrap to 4 rows "
+        f"(200 cells / 60), got {rows_100}"
+    )
+    # 30 family emojis fit in one 60-cell row exactly.
+    assert _rendered_rows_for(family * 30, 60) == 1
+    # 31 family emojis need a second row.
+    assert _rendered_rows_for(family * 31, 60) == 2
+
+    # Modifier sequence: same answer, since each is a 2-cell cluster.
+    hand_light = "\U0001F44B\U0001F3FB"
+    assert _rendered_rows_for(hand_light * 30, 60) == 1
+    assert _rendered_rows_for(hand_light * 31, 60) == 2
+
+
+def test_compute_prompt_modal_scroll_handles_zwj_emoji_cluster_prompt():
+    """Reviewer pin (latest round): a prompt full of ZWJ family
+    emojis (``\\U0001F468\\u200D\\U0001F469\\u200D\\U0001F466`` × 100)
+    must keep the cursor visible inside the modal's inner area.
+
+    Without cluster-aware width measurement, the helper modelled
+    each family as 6 cells, scrolled to ``scroll=6``, and pushed
+    the actual cursor row (which ratatui paints at ~5) *above* the
+    visible window ``[6, 14)``. The operator could see the bottom
+    of the prompt where they weren't typing, while their typed
+    characters appeared below the modal's top border.
+
+    The cluster-aware helper measures each family as 2 cells (one
+    wide grapheme), so 100 families = 200 cells = ~4 wrapped rows,
+    the prompt fits inside the inner 8 rows comfortably, and no
+    scroll is needed (``scroll=0``). The cursor sits in the lower
+    half of the visible window where the operator can see it.
+    """
+    family = "\U0001F468\u200D\U0001F469\u200D\U0001F466"
+    value = family * 100
+    modal = _PromptModal(title="t", value=value)
+    modal.cursor = len(value)
+
+    inner_width, inner_height = 60, 8
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    # Independently re-derive the cursor's rendered row using the
+    # same word-wrap primitive but without going through the
+    # helper under test, so this assertion is meaningful even if
+    # the helper degenerates to a no-op.
+    from auto_iterator.tui import _word_wrap_indices, _CURSOR_GLYPH
+
+    before = value[:modal.cursor]
+    prompt_line = "> " + before + _CURSOR_GLYPH + " "
+    wrapped = _word_wrap_indices(prompt_line, inner_width, trim=False)
+    cursor_idx = 2 + len(before)
+    cursor_row_in_prompt = next(
+        (ri for ri, row in enumerate(wrapped) if cursor_idx in row),
+        len(wrapped) - 1,
+    )
+    cursor_row = 2 + cursor_row_in_prompt  # title (1) + blank (1)
+
+    # The whole point of the bug was that the helper picked a
+    # scroll value that hid the cursor; pin the cursor visibility
+    # directly so a future regression that chooses a different
+    # (still wrong) scroll fails here.
+    assert scroll <= cursor_row < scroll + inner_height, (
+        f"ZWJ-cluster prompt cursor row {cursor_row} not visible "
+        f"in window [{scroll}, {scroll + inner_height}); "
+        f"scroll={scroll}"
+    )
+
+    # Pin the cluster-width oracle independently: 100 families
+    # must fit in the 8-row × 60-col inner area, so no scroll is
+    # needed. Without the cluster-aware fix this would pick
+    # scroll=6 (helper modelled 600 cells / 60 = 10 prompt rows
+    # plus title/blank/footer overflowing).
+    from auto_iterator.tui import _display_cell_width
+    assert _display_cell_width(value) == 200, (
+        "100 family ZWJ emojis must measure as 200 cells, not 600"
+    )
+    assert scroll == 0, (
+        f"ZWJ-cluster prompt fits in 8 rows; helper must not "
+        f"scroll. got scroll={scroll}"
+    )
+
+
+def test_display_cell_width_handles_emoji_presentation_sequences():
+    """VS16 (``\\u{FE0F}``) is the Unicode emoji presentation
+    selector. ratatui's ``unicode-width`` crate widens narrow emoji
+    bases when followed by VS16 — ``☁\\ufe0f`` is rendered as a
+    2-cell glyph, not 1+0=1 cell. The previous helper read width
+    per-codepoint and reported 1 cell, so a prompt full of
+    cloud-VS16 pairs under-counted by half and the cursor row fell
+    below the modal's bottom border.
+
+    Pin the string-level rule directly:
+
+    * Bare ``☁`` (narrow, no VS16) — 1 cell.
+    * ``☁\\ufe0f`` — 2 cells (widened by VS16).
+    * Wide-by-default emoji + VS16 — still 2 cells (no double-count).
+    * Bare VS16 — 0 cells (the widening only applies via lookahead,
+      so a stray VS16 contributes nothing on its own).
+    """
+    assert _display_cell_width("\u2601") == 1
+    assert _display_cell_width("\u2601\ufe0f") == 2
+    assert _display_cell_width("\u2601\ufe0f" * 100) == 200
+    # Wide-by-default base + VS16: VS16 is a no-op (base already wide).
+    assert _display_cell_width("\U0001F600\ufe0f") == 2
+    # Bare VS16 contributes 0 — there's no preceding base to widen.
+    assert _display_cell_width("\ufe0f") == 0
+    assert _display_cell_width("\ufe0f" * 50) == 0
+
+
+def test_rendered_rows_for_handles_emoji_presentation_sequences():
+    """``_rendered_rows_for`` must agree with the per-codepoint
+    string-level VS16 rule: 500 cloud-VS16 clusters at width 60
+    occupy roughly ``ceil(1000 / 60) = 17`` rendered rows, not the
+    ``ceil(500 / 60) = 9`` the previous helper claimed.
+
+    Without this, the modal scroll math under-counts rows for
+    emoji-heavy prompts and the cursor lands below the visible
+    window — the reviewer's pin in the latest round."""
+    cloud_vs16 = "\u2601\ufe0f" * 500
+    rows = _rendered_rows_for(cloud_vs16, 60)
+    # 500 × 2 cells = 1000 cells; 1000 / 60 → 17 rows (last row
+    # holds the leftover 40 cells = 20 cloud-VS16 clusters).
+    assert rows == 17, (
+        f"500 cloud-VS16 clusters at width 60 must wrap to 17 rows "
+        f"(1000 cells / 60), got {rows}"
+    )
+    # Sanity: a single cloud-VS16 fits on one row at width 2 or wider.
+    assert _rendered_rows_for("\u2601\ufe0f", 2) == 1
+    assert _rendered_rows_for("\u2601\ufe0f", 60) == 1
+
+
+def test_compute_prompt_modal_scroll_handles_emoji_presentation_sequence_prompt():
+    """Reviewer pin: a prompt full of emoji-presentation sequences
+    (``☁\\ufe0f`` × 500) must keep the cursor on screen.
+
+    With the per-codepoint width helper, ratatui's ``unicode-width``
+    paints each pair as 2 cells while we modelled them as 1 cell —
+    the wrap math under-counted prompt rows by ~9 at width 60, the
+    cursor row was computed inside the visible window when the
+    actual rendered cursor was 8 rows below the bottom border, and
+    the operator typed blind. The reviewer's exact geometry: 60×8
+    inner area, helper ``scroll=4``, real cursor row ~18, outside
+    the ``[4, 12)`` visible window.
+    """
+    value = "\u2601\ufe0f" * 500
+    modal = _PromptModal(title="t", value=value)
+    modal.cursor = len(value)
+
+    inner_width, inner_height = 60, 8
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    # Independently re-derive the cursor's rendered row using the
+    # same word-wrap primitive, but via a fresh prompt-line build so
+    # the assertion isn't tautological with the helper under test.
+    from auto_iterator.tui import _word_wrap_indices, _CURSOR_GLYPH
+
+    before = value[:modal.cursor]
+    prompt_line = "> " + before + _CURSOR_GLYPH + " "
+    wrapped = _word_wrap_indices(prompt_line, inner_width, trim=False)
+    cursor_idx = 2 + len(before)
+    cursor_row_in_prompt = next(
+        (ri for ri, row in enumerate(wrapped) if cursor_idx in row),
+        len(wrapped) - 1,
+    )
+    cursor_row = 2 + cursor_row_in_prompt  # title (1) + blank (1)
+
+    # The bug only surfaces when the prompt overflows the inner
+    # area; otherwise no scroll is exercised. Pin that here so a
+    # future refactor of the modal layout can't silently turn this
+    # into a "fits on screen" no-op.
+    assert cursor_row >= inner_height, (
+        "test setup: cursor must overflow inner area so VS16 "
+        "scroll path is actually exercised; got cursor_row="
+        f"{cursor_row}, inner_height={inner_height}"
+    )
+
+    assert scroll <= cursor_row < scroll + inner_height, (
+        f"VS16 emoji-prompt cursor row {cursor_row} not visible in "
+        f"window [{scroll}, {scroll + inner_height}); scroll={scroll}"
+    )
+
+
+def test_compute_prompt_modal_scroll_handles_word_wrapped_sentence_prompt():
+    """Reviewer pin: ratatui word-wraps on whitespace, not raw cells,
+    so a prompt full of spaces wraps to many more rows than the old
+    ``ceil(cell_width / inner_width)`` proxy predicted. With 40
+    words of 30 chars each at inner width 60, two words can never
+    share a row (30 + 1 space + 30 = 61 > 60), so each word lands
+    on its own line — ~40 rows for the prompt, plus title/blank
+    above. The previous helper computed ~21 prompt rows from the
+    1242 cell count, picked ``scroll=15``, and the actual cursor at
+    row ~41 fell outside the ``[15, 23)`` visible window. The
+    reviewer's exact repro: with the bug the operator typed blind.
+    """
+    value = " ".join(["x" * 30 for _ in range(40)])
+    modal = _PromptModal(title="t", value=value)
+    modal.cursor = len(value)
+
+    inner_width, inner_height = 60, 8
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    # Independently simulate where the cursor glyph lands by
+    # building the same prompt line the renderer composes and
+    # checking which wrapped row contains it. This mirrors the
+    # contract under test without re-using the helper.
+    from auto_iterator.tui import _word_wrap_indices  # local import
+    prompt_line = "> " + value + "\u258f"
+    wrapped = _word_wrap_indices(prompt_line, inner_width, trim=False)
+    cursor_glyph_idx = 2 + len(value)
+    cursor_row_in_prompt = next(
+        (ri for ri, row in enumerate(wrapped) if cursor_glyph_idx in row),
+        len(wrapped) - 1,
+    )
+    cursor_row = 2 + cursor_row_in_prompt  # title + blank
+
+    # The whole point of the bug: cursor must overflow the inner
+    # area (otherwise no scroll would be exercised), and word-wrap
+    # must produce more rows than the old cell-slicing model.
+    assert cursor_row >= inner_height, (
+        "test setup: cursor must overflow the inner area so the "
+        "word-wrap scroll path is actually exercised"
+    )
+    old_cells = 2 + len(value) + 1
+    old_rows = -(-old_cells // inner_width)  # ceil
+    assert len(wrapped) > old_rows, (
+        f"test setup: word-wrap must produce more rows than the "
+        f"old cell-slicing model ({old_rows}); got {len(wrapped)}"
+    )
+
+    # And the cursor must land inside the visible window the helper
+    # picked — which is the operator-visible contract.
+    assert scroll <= cursor_row < scroll + inner_height, (
+        f"word-wrapped sentence cursor row {cursor_row} not visible "
+        f"in window [{scroll}, {scroll + inner_height}); "
+        f"scroll={scroll}"
+    )
+
+
+def test_compute_prompt_modal_scroll_handles_natural_sentence_prompt():
+    """A natural-language prompt mid-typing — the kind of input a
+    user actually sends — must keep the cursor visible.
+
+    Pin a representative case: a multi-sentence task description
+    (40 short sentences of typical word lengths) with the cursor at
+    the end. The previous cell-slicing helper would land the cursor
+    a couple of rows past the visible window for any prompt whose
+    word-wrap row count exceeded ``ceil(cells / width)`` — i.e. any
+    prompt where words can't pack two-per-row at the modal width.
+    """
+    sentence = "Implement the feature carefully and add tests. "
+    value = sentence * 40  # ~1.8K chars of natural text
+    modal = _PromptModal(title="t", hint="h", value=value)
+    modal.cursor = len(value)
+
+    inner_width, inner_height = 60, 10
+    scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+    from auto_iterator.tui import _word_wrap_indices
+    prompt_line = "> " + value + "\u258f"
+    wrapped = _word_wrap_indices(prompt_line, inner_width, trim=False)
+    cursor_glyph_idx = 2 + len(value)
+    cursor_row_in_prompt = next(
+        (ri for ri, row in enumerate(wrapped) if cursor_glyph_idx in row),
+        len(wrapped) - 1,
+    )
+    # 4 rows above prompt: title + blank + hint + blank.
+    cursor_row = 4 + cursor_row_in_prompt
+
+    assert scroll <= cursor_row < scroll + inner_height, (
+        f"natural-text cursor row {cursor_row} not visible in window "
+        f"[{scroll}, {scroll + inner_height}); scroll={scroll}"
+    )
+
+
+def test_compute_prompt_modal_scroll_keeps_top_visible_for_short_sentence():
+    """A single short word at any cursor position must not scroll.
+
+    The word-wrap simulation must not over-scroll for tiny prompts
+    just because some other long-prompt code path got smarter; the
+    title/hint stay anchored at the top so the operator sees the
+    context."""
+    modal = _PromptModal(
+        title="What should we do?", hint="One sentence, please.",
+        value="hello world",
+    )
+    modal.cursor = 5
+    assert (
+        _compute_prompt_modal_scroll(modal, inner_width=60, inner_height=12)
+        == 0
+    )
+
+
+def test_word_wrap_indices_word_separated_input_packs_when_room_remains():
+    """Pin ratatui's WordWrapper-with-trim=False packing semantics.
+
+    Two short words separated by a space must share a row when the
+    combined cell width fits. A long word that wouldn't fit on the
+    current row goes on its own row instead of being split mid-word
+    (the operator-visible reason ratatui needs word-wrap rather
+    than raw cell-slicing)."""
+    from auto_iterator.tui import _word_wrap_indices
+
+    # Two short words fit on one row.
+    rows = _word_wrap_indices("hi there", 20, trim=False)
+    assert len(rows) == 1, (
+        "short space-separated text must pack onto one row; "
+        f"got {len(rows)} rows"
+    )
+
+    # Two 30-char words at width 60 cannot share (30+1+30=61>60),
+    # so each gets its own row.
+    rows = _word_wrap_indices(
+        " ".join(["x" * 30 for _ in range(3)]), 60, trim=False,
+    )
+    assert len(rows) == 3, (
+        "three 30-char words at width 60 must wrap to 3 rows "
+        f"(no two pack together); got {len(rows)}"
+    )
+
+    # A word longer than the row width is character-wrapped.
+    rows = _word_wrap_indices("x" * 250, 100, trim=False)
+    assert len(rows) == 3  # 100 + 100 + 50
+
+
+def test_rendered_rows_for_word_wraps_space_separated_text():
+    """``_rendered_rows_for`` must agree with ratatui's word-wrap
+    for space-separated text, not the cell-slicing approximation
+    used previously.
+
+    Pin the operator-visible consequence: 40 words of 30 chars at
+    width 60 wraps to ~40 rows under word-wrap (each pair of words
+    is 61 cells, can't share a row), not the ~20 rows
+    ``ceil(cell_width / width)`` reported. The agent-log scroll
+    math relies on this primitive, so an undercount silently
+    clipped trailing rendered rows below the panel border."""
+    text = " ".join(["x" * 30 for _ in range(40)])
+    rows = _rendered_rows_for(text, 60)
+    assert rows >= 39, (
+        f"40 words × 30 chars at width 60 must wrap to ≥39 rows "
+        f"under word-wrap; got {rows} (cell-slicing would say 20)"
+    )
+
+    # No-space text is unchanged: the word-wrap result equals the
+    # cell-slicing result when there are no separators.
+    assert _rendered_rows_for("x" * 100, 60) == 2
+    assert _rendered_rows_for("x" * 60, 60) == 1
+    assert _rendered_rows_for("", 60) == 1
+
+
+def test_render_prompt_modal_keeps_cursor_visible_in_80x24_terminal():
+    """End-to-end pin: at 80×24 (the reviewer's repro geometry), a
+    500-char prompt plus title/hint/footer exceeds the modal's inner
+    height. The rendered Paragraph must therefore receive a
+    non-zero scroll offset so the cursor row is on screen.
+
+    pyratatui's ``Paragraph.__repr__`` doesn't expose ``scroll``, so
+    we re-derive the offset via the public helper using the live
+    modal area the renderer hands to ``frame.render_widget``."""
+    import pyratatui as pr
+
+    rows = [_make_run_row()]
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch(
+            "auto_iterator.tui.list_runs", return_value=rows,
+        ):
+            app = RunListApp(Path(tmp))
+            _press(app, "n")  # open new-run prompt modal
+            modal = app.screen.modals[-1]
+            assert isinstance(modal, _PromptModal)
+            modal.value = "x" * 500
+            modal.cursor = len(modal.value)
+
+        frame = _make_stub_frame(width=80, height=24)
+        _render_run_list(app.screen, frame, pr)
+
+        prompt_area = None
+        for widget, area in frame.widgets:
+            if repr(widget).startswith("Paragraph"):
+                prompt_area = area
+        assert prompt_area is not None, (
+            "expected the modal renderer to emit a Paragraph"
+        )
+
+        inner_width = max(1, prompt_area.width - 2)
+        inner_height = max(1, prompt_area.height - 2)
+        scroll = _compute_prompt_modal_scroll(modal, inner_width, inner_height)
+
+        # Cursor visibility: derive the cursor's absolute row in the
+        # wrapped output and assert it's within the visible window
+        # ``[scroll, scroll + inner_height)``.
+        cursor_col = 2 + len(modal.value)
+        cursor_row = 2 + cursor_col // inner_width
+        assert scroll <= cursor_row < scroll + inner_height, (
+            "the cursor of a 500-char prompt at 80×24 must be visible "
+            f"in the modal; scroll={scroll}, cursor_row={cursor_row}, "
+            f"inner_height={inner_height}"
+        )
+
+
+def test_prompt_modal_empty_value_with_placeholder_shows_cursor():
+    """Empty value + placeholder still shows a leading cursor cell.
+
+    Otherwise the operator would see only ``> [placeholder]`` with no
+    indicator of where typing will land. The cursor sits at column 0
+    as a glyph + reversed space; the placeholder is dimmed; the next
+    printable keystroke replaces this branch with the value-bearing
+    one.
+    """
+    import pyratatui as pr
+
+    modal = _PromptModal(title="t", placeholder="ph", value="")
+    text = _build_prompt_modal_text(modal, pr)
+    spans = _prompt_line_spans(text)
+    assert [s.content for s in spans] == [
+        "> ", _CURSOR_GLYPH, " ", "[ph]",
+    ], (
+        f"got {[s.content for s in spans]!r}"
+    )
+    assert "REVERSED" in repr(spans[2].style)
 
 
 def test_render_run_detail_paragraph_has_wrap_enabled():
