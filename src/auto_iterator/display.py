@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -1235,6 +1236,154 @@ class LogTailer:
         return text.splitlines()
 
 
+# ── Native ``less`` pager (full-file, native scrollback + mouse) ────────────
+
+
+def _less_argv(less_path: str, agent_log: Path) -> list[str]:
+    """Build the argv used to view *agent_log* in native ``less``.
+
+    The flags are deliberately minimal so ``less`` owns terminal
+    behaviour and we don't try to emulate a custom TUI:
+
+    * ``-R``     — pass through ANSI colour escapes (the agent
+      transcript can contain them).
+    * ``--mouse`` — enable wheel/click navigation. When this is not
+      supported by the installed ``less``, the caller falls back
+      to the streaming tail rather than launching ``less`` and
+      having it bail with a usage error.
+    * ``+G``     — start at the bottom (most recent line) but in
+      *normal* viewing mode, not ``+F`` follow mode. The first
+      mouse-wheel scroll then moves the view immediately instead of
+      being swallowed by follow mode (which is the source of the
+      "scroll feels hung" complaint with stock ``less +F``).
+
+    Notably absent:
+
+    * ``+F`` — follow-mode-as-default has the wheel-swallowing UX
+      bug above. Operators who *want* follow mode press ``F`` once
+      they're inside.
+    * ``-X`` — letting ``less`` send its terminal init/deinit
+      sequences is what cleans up the alternate screen and mouse
+      tracking on exit. Suppressing it makes the run-list TUI
+      handoff stale and forced us into "redraw on return" hacks
+      previously.
+    * any lesskey / ``LESSPROMPT`` overrides — operator config
+      should be honoured, not fought; the previous bridge approach
+      broke when operators set ``LESSPROMPT`` because it parsed the
+      status row.
+    """
+    return [less_path, "-R", "--mouse", "+G", str(agent_log)]
+
+
+def _less_supports_mouse(less_path: str) -> bool:
+    """Heuristically check whether *less_path* understands ``--mouse``.
+
+    Reads ``less --help`` (and ``less --version`` as a backup, since
+    older builds print help to stderr) and looks for the ``--mouse``
+    token. Returns ``False`` on any error so the caller can take the
+    fallback path rather than launch a ``less`` invocation that exits
+    with a usage error.
+
+    The check is intentionally conservative — a false negative just
+    drops the operator into the streaming tail, which is the
+    pre-pager UX. A false positive would strand them in a ``less``
+    that refuses to start, which is much worse."""
+    try:
+        result = subprocess.run(
+            [less_path, "--help"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    blob = (result.stdout or "") + "\n" + (result.stderr or "")
+    return "--mouse" in blob
+
+
+def view_log_in_less(
+    agent_log: Path,
+    *,
+    fallback: Optional[Callable[[], int]] = None,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    mouse_check: Optional[Callable[[str], bool]] = None,
+    stderr=None,
+) -> int:
+    """Open *agent_log* for full-file viewing with native ``less``.
+
+    The contract is "let ``less`` own the terminal":
+
+    * Spawn ``less -R --mouse +G <agent_log>`` via :func:`subprocess.run`.
+      No PTY bridge, no escape-sequence rewriting, no status-row
+      parsing — the previous custom-TUI-on-top-of-``less`` approach
+      was inherently brittle and broke whenever operators tweaked
+      ``LESS`` / ``LESSPROMPT``.
+    * Native follow controls are the UX contract: ``F`` follows new
+      writes, ``Ctrl-C`` unfollows, ``q`` quits.
+    * On exit, :func:`subprocess.run` returns and the parent process
+      regains the controlling terminal — ``less`` itself
+      deinitialises the alternate screen and mouse tracking on the
+      way out, so callers don't need handoff hacks.
+
+    When ``less`` is missing or its ``--mouse`` flag is not
+    supported, a one-line warning is written to *stderr* and the
+    *fallback* hook (default: no-op) is invoked. Production callers
+    pass ``fallback=lambda: stream_log(paths, log_lines=None)`` so
+    the operator still gets the full transcript, just without the
+    pager-grade navigation.
+
+    The ``runner`` / ``which`` / ``mouse_check`` / ``stderr`` hooks
+    are test affordances — production callers leave them as defaults.
+    """
+    if stderr is None:
+        stderr = sys.stderr
+
+    less_path = which("less")
+    if less_path is None:
+        print(
+            "warning: `less` not found on PATH; falling back to the "
+            "streaming tail (Esc / q / Ctrl-C to exit).",
+            file=stderr,
+        )
+        return _run_pager_fallback(fallback)
+
+    check = mouse_check if mouse_check is not None else _less_supports_mouse
+    if not check(less_path):
+        print(
+            "warning: this `less` does not advertise --mouse support; "
+            "falling back to the streaming tail (Esc / q / Ctrl-C to exit).",
+            file=stderr,
+        )
+        return _run_pager_fallback(fallback)
+
+    argv = _less_argv(less_path, agent_log)
+    try:
+        result = runner(argv, check=False)
+    except (OSError, FileNotFoundError) as exc:
+        print(
+            f"warning: failed to launch `less` ({exc}); falling back "
+            "to the streaming tail (Esc / q / Ctrl-C to exit).",
+            file=stderr,
+        )
+        return _run_pager_fallback(fallback)
+    return int(getattr(result, "returncode", 0) or 0)
+
+
+def _run_pager_fallback(fallback: Optional[Callable[[], int]]) -> int:
+    """Run *fallback* if provided, otherwise return ``0``.
+
+    Centralised so the missing-``less`` and missing-mouse and
+    runner-failed branches all behave identically — the operator
+    sees one warning and ends up in the streaming tail."""
+    if fallback is None:
+        return 0
+    return int(fallback() or 0)
+
+
 __all__ = [
     "LogTailer",
     "fit_section_caps",
@@ -1248,4 +1397,5 @@ __all__ = [
     "stream_log",
     "tail_text_file",
     "tail_text_file_with_offset",
+    "view_log_in_less",
 ]

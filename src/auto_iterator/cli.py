@@ -395,6 +395,12 @@ def _build_parser() -> argparse.ArgumentParser:
                              "over high-latency SSH the default streaming "
                              "mode is much smoother because scrolling is "
                              "handled client-side.")
+    show_p.add_argument("--pager", action="store_true",
+                        help="Open the run's logs/agent.log in native "
+                             "`less` for full-file navigation (mouse "
+                             "wheel, search, follow with `F`, quit "
+                             "with `q`). Falls back to --stream if "
+                             "`less` or its --mouse flag is missing.")
     show_p.add_argument("--event-lines", type=int, default=12,
                         help="Recent events to show in the combined view "
                              "(default 12).")
@@ -716,6 +722,32 @@ def cmd_show(args: argparse.Namespace, runs_dir: Path) -> int:
             run.paths,
             refresh_seconds=refresh,
             initial_log_lines=log_lines,
+        )
+
+    if getattr(args, "pager", False):
+        # Explicit ``--pager``: open the agent transcript in native
+        # ``less`` so the operator gets full-file scrollback, mouse
+        # wheel navigation, search, and ``F`` to follow. Requires an
+        # interactive TTY for the same reason ``--tui`` does — a
+        # ``less`` invocation against a pipe is not what the operator
+        # is asking for. Falls back to streaming when ``less`` or its
+        # ``--mouse`` flag is missing.
+        if not _stdout_is_tty():
+            print(
+                "error: --pager requires an interactive terminal; "
+                "stdout is not a TTY.",
+                file=sys.stderr,
+            )
+            return EXIT_USER_ERROR
+        from .display import stream_log, view_log_in_less
+        refresh = max(0.05, float(getattr(args, "refresh", 0.4) or 0.4))
+        return view_log_in_less(
+            run.paths.agent_log,
+            fallback=lambda: stream_log(
+                run.paths,
+                log_lines=None,
+                poll_seconds=refresh,
+            ),
         )
 
     if not _stdout_is_tty() and not getattr(args, "stream", False):
@@ -1224,15 +1256,18 @@ def cmd_tui(_args: argparse.Namespace, runs_dir: Path) -> int:
     cleanly through the shell.
 
     On Enter-on-row, the run-list TUI exits and we hand off to
-    :func:`auto_iterator.display.stream_log` for the selected run.
-    The reason for the handoff (instead of pushing an in-process
-    detail screen) is the high-latency-SSH lag story: streaming on
-    the regular screen buffer means the local terminal's native
-    scrollback owns navigation, so PageUp / mouse-wheel / tmux
-    copy-mode all work at zero round-trip. Pushing a pyratatui
-    ``RunDetailScreen`` would route every scroll keystroke back to
-    the remote host and re-introduce exactly the lag this change
-    was made to fix."""
+    :func:`auto_iterator.display.view_log_in_less` for the selected
+    run. ``less`` is the right tool for the job: it owns the
+    terminal end-to-end (alternate screen, mouse tracking, native
+    scrollback, search, follow-with-``F``), so we don't have to
+    emulate any of that in Python. The previous custom-bridge
+    approach tried to wrap ``less +F`` and rewrite escape sequences
+    on the fly; that broke whenever operators tweaked ``LESS`` or
+    ``LESSPROMPT`` and is the regression this change exists to
+    avoid. Falls back to :func:`auto_iterator.display.stream_log`
+    when ``less`` (or its ``--mouse`` flag) isn't available so the
+    operator still gets the full transcript.
+    """
     if not _stdout_is_tty():
         print(
             "error: `ai` (no subcommand) opens an interactive TUI; "
@@ -1241,26 +1276,24 @@ def cmd_tui(_args: argparse.Namespace, runs_dir: Path) -> int:
         )
         return EXIT_USER_ERROR
     from .tui import run_list_app_with_selection
-    rc, selection = run_list_app_with_selection(runs_dir)
-    if selection is None:
-        return rc
-    # Operator picked a run from the list. Drop into the streaming
-    # tail on the regular screen buffer with ``log_lines=None`` so
-    # the *entire* transcript is dumped into the local terminal's
-    # scrollback. Anything less truncates older history that's no
-    # longer reachable once the alt-screen TUI tears down — the
-    # whole point of native-scrollback streaming is that the local
-    # terminal owns navigation, and that's only useful if the bytes
-    # you want to scroll back to were actually written there. A
-    # bounded seed (we used to pass ``log_lines=200``) silently
-    # hides anything older than the cap, which matches the
-    # operator's "I cannot see the full log" complaint exactly.
-    from .display import stream_log
-    return stream_log(
-        selection,
-        log_lines=None,
-        poll_seconds=0.4,
-    )
+    while True:
+        rc, selection = run_list_app_with_selection(runs_dir)
+        if selection is None:
+            return rc
+        # Operator picked a run from the list. Open ``logs/agent.log``
+        # in native ``less`` so the local terminal owns navigation
+        # (mouse wheel, search, ``F`` to follow, ``q`` to quit). When
+        # ``less`` exits we re-open the run list so the operator
+        # can pick another run without retyping ``ai``.
+        from .display import stream_log, view_log_in_less
+        view_log_in_less(
+            selection.agent_log,
+            fallback=lambda paths=selection: stream_log(
+                paths,
+                log_lines=None,
+                poll_seconds=0.4,
+            ),
+        )
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:

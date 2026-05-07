@@ -518,45 +518,49 @@ def test_show_tui_flag_errors_when_stdout_not_tty(
         assert "TTY" in err or "tty" in err
 
 
-# ── bare ``ai`` (run-list TUI) → Enter routes to stream_log ─────────────────
+# ── bare ``ai`` (run-list TUI) → Enter routes to the less pager ─────────────
 
 
-def test_bare_ai_enter_on_run_routes_to_stream_log(
+def test_bare_ai_enter_on_run_routes_to_less_pager(
     capsys, monkeypatch,
 ) -> None:
-    """Bare ``ai`` → Enter on a row drops into the streaming tail.
+    """Bare ``ai`` → Enter on a row drops into the native ``less`` pager.
 
-    The lag story this whole change addresses is that pushing an
-    in-process pyratatui detail screen from the run-list re-routes
-    every scroll keystroke through a network round-trip. The fix is
-    a two-step handoff:
+    The lag story this redesign addresses: the previous in-process
+    pyratatui detail screen routed every scroll keystroke through a
+    network round-trip; the bridged-``less`` approach that came
+    after wrapped the pager in a Python PTY and rewrote escape
+    sequences (which broke the moment operators touched ``LESS`` /
+    ``LESSPROMPT``). The robust fix is to spawn native ``less`` and
+    let it own the terminal end-to-end. This test pins that:
 
       1. ``RunListApp`` exits cleanly on Enter, surfacing the chosen
          run via ``app.streamed_run`` (tested in
          ``tests/test_tui_smoke.py``).
       2. ``cmd_tui`` reads ``streamed_run`` and dispatches into
-         :func:`auto_iterator.display.stream_log`, which writes plain
-         bytes to the regular screen buffer.
-
-    This test pins step 2: monkey-patch ``run_list_app_with_selection``
-    to short-circuit the live TUI loop and return a selection
-    sentinel, then assert the CLI follows up with a ``stream_log``
-    call against the same paths."""
+         :func:`auto_iterator.display.view_log_in_less` against the
+         selected run's ``logs/agent.log``.
+      3. After ``less`` exits, the run list is re-opened so the
+         operator can pick another run without retyping ``ai``.
+    """
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
-    captured: dict = {}
+    pager_calls: dict = {"argv": [], "agent_logs": []}
 
-    def fake_stream(paths, *, log_lines, poll_seconds):
-        captured["paths"] = paths
-        captured["log_lines"] = log_lines
-        captured["poll_seconds"] = poll_seconds
+    def fake_view(agent_log, *, fallback=None, **kwargs):
+        pager_calls["agent_logs"].append(agent_log)
         return EXIT_OK
+
+    list_calls = {"n": 0}
 
     with tempfile.TemporaryDirectory() as tmp:
         paths = _seed_run(Path(tmp))
 
         def fake_list_app(_runs_dir):
-            return EXIT_OK, paths
+            list_calls["n"] += 1
+            if list_calls["n"] == 1:
+                return EXIT_OK, paths
+            return EXIT_OK, None  # second pass: operator quits the list
 
         import auto_iterator.tui as _tui
         monkeypatch.setattr(
@@ -565,45 +569,44 @@ def test_bare_ai_enter_on_run_routes_to_stream_log(
         )
         from auto_iterator import display as _display
         monkeypatch.setattr(
-            _display, "stream_log", fake_stream, raising=True,
+            _display, "view_log_in_less", fake_view, raising=True,
         )
 
         rc = main(["--runs-dir", tmp])
         assert rc == EXIT_OK
 
-    assert captured.get("paths") is not None, (
+    assert pager_calls["agent_logs"], (
         "Enter on a run from the bare-ai run-list must dispatch "
-        "into display.stream_log; otherwise scroll keystrokes go "
-        "through pyratatui's frame loop and we re-introduce the "
-        "high-latency-SSH lag the redesign exists to fix."
+        "into display.view_log_in_less so native ``less`` owns the "
+        "terminal; the previous Python-bridge approach was brittle."
     )
-    assert captured["paths"].run_id == paths.run_id
-    # The handoff must request the *full* transcript (log_lines=None)
-    # rather than a bounded tail. A bounded seed silently truncates
-    # anything older than the cap, leaving the operator unable to
-    # scroll back to the rest of the log — the local terminal's
-    # scrollback can only show what was actually written to it.
-    assert captured["log_lines"] is None, (
-        "Enter on a run must seed the full transcript, not a tail; "
-        "otherwise the operator cannot see the full log via native "
-        "scrollback once the alt-screen TUI tears down."
+    assert pager_calls["agent_logs"][0] == paths.agent_log, (
+        "the pager must be opened against the selected run's "
+        "logs/agent.log (not some other path)"
+    )
+    assert list_calls["n"] >= 2, (
+        "after `less` exits the run list must be re-opened so the "
+        "operator can pick another run without retyping ``ai``"
     )
 
 
-def test_bare_ai_quit_without_selection_does_not_call_stream_log(
+def test_bare_ai_quit_without_selection_does_not_open_pager(
     capsys, monkeypatch,
 ) -> None:
-    """Quitting the run-list TUI without picking a run must NOT then
-    drop into ``stream_log``.
+    """Quitting the run-list TUI without picking a run must NOT open
+    the pager.
 
-    The handoff trigger is an explicit selection (``streamed_run !=
-    None``); a plain ``q`` / Ctrl-C from the run list returns the
-    operator to the shell. Otherwise a "just exploring runs" exit
-    would silently start tailing whatever happened to be highlighted
-    last."""
+    The handoff trigger is an explicit selection; a plain ``q`` /
+    Ctrl-C from the run list returns the operator to the shell.
+    Otherwise a "just exploring runs" exit would silently open
+    whatever happened to be highlighted last."""
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
 
-    routed = {"stream": False}
+    routed = {"pager": False, "stream": False}
+
+    def fake_view(agent_log, *, fallback=None, **kwargs):
+        routed["pager"] = True
+        return EXIT_OK
 
     def fake_stream(paths, *, log_lines, poll_seconds):
         routed["stream"] = True
@@ -622,12 +625,74 @@ def test_bare_ai_quit_without_selection_does_not_call_stream_log(
         )
         from auto_iterator import display as _display
         monkeypatch.setattr(
+            _display, "view_log_in_less", fake_view, raising=True,
+        )
+        monkeypatch.setattr(
             _display, "stream_log", fake_stream, raising=True,
         )
 
         rc = main(["--runs-dir", tmp])
         assert rc == EXIT_OK
 
-    assert routed["stream"] is False, (
-        "no selection ⇒ no follow-up stream_log call"
+    assert routed["pager"] is False, (
+        "no selection ⇒ no follow-up pager call"
     )
+    assert routed["stream"] is False, (
+        "no selection ⇒ no follow-up stream_log call either"
+    )
+
+
+# ── ``ai show --pager`` → routes to view_log_in_less in a TTY ──────────────
+
+
+def test_show_pager_routes_to_view_log_in_less_for_tty(
+    capsys, monkeypatch,
+) -> None:
+    """``ai show <run> --pager`` opens the agent log in native ``less``.
+
+    The flag is the explicit operator-asks-for-it counterpart to the
+    bare-``ai`` Enter handoff: same helper, same UX. We monkey-patch
+    :func:`auto_iterator.display.view_log_in_less` so the test
+    doesn't actually spawn a child process."""
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+
+    captured: dict = {}
+
+    def fake_view(agent_log, *, fallback=None, **kwargs):
+        captured["agent_log"] = agent_log
+        captured["fallback"] = fallback
+        return EXIT_OK
+
+    from auto_iterator import display as _display
+
+    monkeypatch.setattr(_display, "view_log_in_less", fake_view, raising=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run(Path(tmp))
+        rc = main(["--runs-dir", tmp, "show", paths.run_id, "--pager"])
+        assert rc == EXIT_OK
+
+    assert captured.get("agent_log") == paths.agent_log
+    # Fallback must be a no-arg callable (so the helper can route the
+    # missing-``less`` / missing-``--mouse`` cases without bleeding
+    # the dispatcher's plumbing into the helper's signature).
+    assert callable(captured.get("fallback"))
+
+
+def test_show_pager_errors_when_stdout_not_tty(capsys) -> None:
+    """``--pager`` requires an interactive TTY.
+
+    Spawning ``less`` against a pipe is not what the operator is
+    asking for — surface a clean error instead. Mirrors how
+    ``--tui`` and bare ``ai`` reject non-TTY stdout."""
+    # capsys gives a non-TTY stdout already; no monkeypatch needed.
+    assert not sys.stdout.isatty()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = _seed_run(Path(tmp))
+        rc = main([
+            "--runs-dir", tmp, "show", paths.run_id, "--pager",
+        ])
+        err = capsys.readouterr().err
+        assert rc != EXIT_OK
+        assert "TTY" in err or "tty" in err

@@ -57,7 +57,13 @@ coverage.xml
 *.cover
 *.py.cover
 .hypothesis/
-.pytest_cache/
+# Trailing slash omitted on purpose: auto-iterator worktrees often
+# symlink ``.pytest_cache`` to a shared parent's cache to avoid
+# duplicating it, and ``.pytest_cache/`` (with the slash) only
+# matches real directories — the symlink would silently leak into
+# ``git status`` otherwise. Same rationale as ``__pycache__`` and
+# ``prompts`` above.
+.pytest_cache
 cover/
 
 # Translations
